@@ -1,0 +1,69 @@
+meshtastic_bridge_node:
+  ros__parameters:
+    # Radio connection. The board must run Meshtastic firmware ("Tlora T3s3 V1"
+    # in the web flasher), not LilyGo's factory test image.
+    # "auto" picks the single Meshtastic-capable serial port; set a path such
+    # as /dev/ttyACM0 if several are connected. tcp_host (IP or hostname of a
+    # board with Wi-Fi enabled) takes precedence over serial when set.
+    serial_port: auto
+    tcp_host: ""
+    # Seconds to wait for the device's config on connect. Needs meshtastic
+    # >= 2.5 in Python; older releases always wait 300 s.
+    connect_timeout_s: 30
+
+    # Checked on connect. A mismatch only logs a warning/error.
+    # Empty disables the check.
+    expected_hw_model: TLORA_T3_S3
+    min_firmware_version: ""
+
+    # Name other devices see this one under, e.g. /drone1/gps/fix.
+    # Empty: derived from the Meshtastic node id (node_a1b2c3d4).
+    device_name: ""
+
+    # tx_enabled: send local topics into the mesh.
+    # rx_enabled: publish what other devices send. Set to false on devices
+    # that only report and never need fleet data, e.g. an autonomous drone.
+    tx_enabled: true
+    rx_enabled: true
+
+    # Glob patterns (fnmatch) on full topic names. A topic is bridged if it
+    # matches include_topics and none of exclude_topics. Topics this bridge
+    # publishes itself are always excluded to avoid loops.
+    include_topics: ["*"]
+    exclude_topics: ["/rosout", "/parameter_events", "/mesh/*", "/tf", "/tf_static"]
+
+    # Receive filters (glob patterns). Devices match by Meshtastic node id
+    # ("!a1b2c3d4") or announced device name ("drone*"); the block list wins.
+    # Topics match the name on the sending device ("/gps/fix").
+    allow_devices: ["*"]
+    # block_devices: ["!deadbeef", "test_*"]
+    rx_include_topics: ["*"]
+    # rx_exclude_topics: ["/debug/*"]
+
+    # LoRa carries a few hundred bytes per second at best and the channel is
+    # shared by every device. Each topic sends at most one message (its
+    # latest) per interval. First matching "pattern=seconds" entry wins,
+    # otherwise min_interval_s applies.
+    min_interval_s: 10.0
+    topic_intervals: ["/gps/fix=5.0", "/battery_state=60.0"]
+
+    # Messages larger than one LoRa packet are split into fragments. Above
+    # this many fragments a message is not sent (each costs airtime and one
+    # lost fragment loses the whole message).
+    max_fragments: 4
+
+    scan_period_s: 5.0
+    announce_period_s: 300.0
+
+    # Received topics: /<remote_namespace>/<device>/<topic>.
+    remote_namespace: "mesh"
+    link_quality_topic: /mesh/link_quality
+
+    # Meshtastic settings. dest "^all" broadcasts to the whole mesh.
+    dest: "^all"
+    channel_index: 0
+    # 0 uses the firmware default (lora.hop_limit, normally 3).
+    hop_limit: 0
+    port_num: PRIVATE_APP
+    max_payload_bytes: 233
+    poll_hz: 20.0

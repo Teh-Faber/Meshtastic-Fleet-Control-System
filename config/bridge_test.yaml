@@ -1,0 +1,37 @@
+# Bridge settings used by the launch files in scripts/launch/*_test.launch.py.
+# Only the test topics are bridged, and they are not rate limited so the
+# tests measure the radio link rather than the bridge's rate limiter.
+meshtastic_bridge_node:
+  ros__parameters:
+    serial_port: auto
+    tcp_host: ""
+    connect_timeout_s: 30
+    expected_hw_model: TLORA_T3_S3
+    min_firmware_version: ""
+    allow_devices: ["*"]
+    rx_include_topics: ["*"]
+    device_name: ""
+    tx_enabled: true
+    rx_enabled: true
+
+    include_topics: ["/link_test/*", "/emulated/*"]
+    exclude_topics: ["/rosout", "/parameter_events", "/mesh/*"]
+
+    min_interval_s: 0.0
+    # The emulated device behaves like a real one.
+    topic_intervals: ["/emulated/*=10.0"]
+    max_fragments: 4
+
+    # Scan often so test topics are picked up quickly after start.
+    scan_period_s: 1.0
+    announce_period_s: 60.0
+
+    remote_namespace: ""
+    link_quality_topic: /mesh/link_quality
+
+    dest: "^all"
+    channel_index: 0
+    hop_limit: 0
+    port_num: PRIVATE_APP
+    max_payload_bytes: 233
+    poll_hz: 20.0
