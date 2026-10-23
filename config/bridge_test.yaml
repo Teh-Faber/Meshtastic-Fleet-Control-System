@@ -8,6 +8,11 @@ meshtastic_bridge_node:
     connect_timeout_s: 30
     expected_hw_model: TLORA_T3_S3
     min_firmware_version: ""
+    # Set the same preset on both devices to compare presets, e.g. SHORT_FAST
+    # (region EU_868) or NARROW_FAST (region EU_N_868, firmware 2.8+).
+    lora_region: ""
+    modem_preset: ""
+    reboot_wait_s: 20.0
     allow_devices: ["*"]
     rx_include_topics: ["*"]
     device_name: ""

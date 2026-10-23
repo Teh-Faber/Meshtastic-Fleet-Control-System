@@ -108,6 +108,9 @@ class BridgeNode(Node):
         self.declare_parameter('connect_timeout_s', 30)
         self.declare_parameter('expected_hw_model', 'TLORA_T3_S3')
         self.declare_parameter('min_firmware_version', '')
+        self.declare_parameter('lora_region', '')
+        self.declare_parameter('modem_preset', '')
+        self.declare_parameter('reboot_wait_s', 20.0)
         self.declare_parameter('device_name', '')
         self.declare_parameter('tx_enabled', True)
         self.declare_parameter('rx_enabled', True)
@@ -136,6 +139,9 @@ class BridgeNode(Node):
         self.connect_timeout_s = self.param('connect_timeout_s')
         self.expected_hw_model = self.param('expected_hw_model')
         self.min_firmware_version = self.param('min_firmware_version')
+        self.lora_region = self.param('lora_region').upper()
+        self.modem_preset = self.param('modem_preset').upper()
+        self.reboot_wait_s = self.param('reboot_wait_s')
         self.tx_enabled = self.param('tx_enabled')
         self.rx_enabled = self.param('rx_enabled')
         self.include_topics = self.param('include_topics')
@@ -260,11 +266,61 @@ class BridgeNode(Node):
             # TODO: retry on a timer instead of staying disconnected.
             self.interface = None
             return
-        if self.interface is not None:
-            self.check_device()
+        if self.interface is None:
+            return
+        lora = self.check_device()
+        if lora is not None and self.apply_radio_settings(lora):
+            # Writing the LoRa config reboots the device; reconnect once it is back.
+            self.interface.close()
+            time.sleep(self.reboot_wait_s)
+            # Drop the "connection lost" event from the old interface so it
+            # does not disconnect the new one.
+            self._inbox = queue.Queue()
+            try:
+                self.interface = self.open_interface()
+            except Exception as e:
+                self.get_logger().error(f'Could not reconnect after applying LoRa settings: {e}')
+                self.interface = None
+                return
+            if self.interface is not None:
+                self.check_device()
+
+    def apply_radio_settings(self, lora):
+        """Write ``lora_region``/``modem_preset`` to the device if they differ. True if written."""
+        lora_config = config_pb2.Config.LoRaConfig
+        changes = {}
+        try:
+            if self.lora_region:
+                region = lora_config.RegionCode.Value(self.lora_region)
+                if lora.region != region:
+                    changes['region'] = region
+            if self.modem_preset:
+                preset = lora_config.ModemPreset.Value(self.modem_preset)
+                if not lora.use_preset or lora.modem_preset != preset:
+                    changes['modem_preset'] = preset
+        except ValueError as e:
+            self.get_logger().error(
+                f'Unknown LoRa setting ({e}). Newer presets such as NARROW_FAST need an '
+                'up-to-date meshtastic Python package and firmware')
+            return False
+        if not changes:
+            return False
+        for field, value in changes.items():
+            setattr(lora, field, value)
+        lora.use_preset = True
+        self.get_logger().warn(
+            f'Writing LoRa config ({self.lora_region or "region unchanged"}, '
+            f'{self.modem_preset or "preset unchanged"}); device reboots to apply it. '
+            'Every device in the fleet must use the same region and preset')
+        self.interface.localNode.writeConfig('lora')
+        return True
 
     def check_device(self):
-        """Log hardware, firmware and radio setup; warn about anything that blocks the link."""
+        """
+        Log hardware, firmware and radio setup; warn about anything that blocks the link.
+
+        Returns the device's LoRa config, or None if it could not be read.
+        """
         log = self.get_logger()
         user = (self.interface.getMyNodeInfo() or {}).get('user', {})
         hw_model = user.get('hwModel', 'UNKNOWN')
@@ -286,13 +342,18 @@ class BridgeNode(Node):
             preset = config_pb2.Config.LoRaConfig.ModemPreset.Name(lora.modem_preset)
         except (AttributeError, ValueError) as e:
             log.warn(f'Could not read LoRa config: {e}')
-            return
+            return None
         log.info(f'LoRa region {region}, modem preset {preset}')
-        if region == 'UNSET':
-            log.error('LoRa region is UNSET, the radio will not transmit. Set it with '
-                      '`meshtastic --set lora.region EU_868` (or your region)')
+        if region == 'UNSET' and not self.lora_region:
+            log.error('LoRa region is UNSET, the radio will not transmit. Set lora_region '
+                      'or run `meshtastic --set lora.region EU_868` (or your region)')
         if not lora.tx_enabled:
             log.error('LoRa transmit is disabled on the device (lora.tx_enabled = false)')
+        wanted_region = self.lora_region or region
+        wanted_preset = self.modem_preset or preset
+        if wanted_preset.startswith('NARROW') and wanted_region != 'EU_N_868':
+            log.warn(f'{wanted_preset} is only available in region EU_N_868 (firmware 2.8+)')
+        return lora
 
     def resolve_device_name(self, configured):
         """Use the configured name, else the Meshtastic node id, else the hostname."""

@@ -16,6 +16,15 @@ meshtastic_bridge_node:
     expected_hw_model: TLORA_T3_S3
     min_firmware_version: ""
 
+    # Radio settings written to the device on connect if they differ (the
+    # device then reboots; the bridge waits reboot_wait_s and reconnects).
+    # Empty leaves the device as configured. All devices must match.
+    #   lora_region:  EU_868 (all classic presets) or EU_N_868 (NARROW_* presets, fw 2.8+)
+    #   modem_preset: LONG_FAST (default), MEDIUM_FAST, SHORT_FAST, NARROW_FAST, ...
+    lora_region: ""
+    modem_preset: ""
+    reboot_wait_s: 20.0
+
     # Name other devices see this one under, e.g. /drone1/gps/fix.
     # Empty: derived from the Meshtastic node id (node_a1b2c3d4).
     device_name: ""
@@ -40,12 +49,17 @@ meshtastic_bridge_node:
     rx_include_topics: ["*"]
     # rx_exclude_topics: ["/debug/*"]
 
-    # LoRa carries a few hundred bytes per second at best and the channel is
-    # shared by every device. Each topic sends at most one message (its
-    # latest) per interval. First matching "pattern=seconds" entry wins,
-    # otherwise min_interval_s applies.
-    min_interval_s: 10.0
-    topic_intervals: ["/gps/fix=5.0", "/battery_state=60.0"]
+    # Each topic sends at most one message (its latest) per interval. First
+    # matching "pattern=seconds" entry wins, otherwise min_interval_s applies.
+    #
+    # Airtime budget: Meshtastic's EU_868 region (869.4-869.65 MHz) allows
+    # 10 % duty cycle, i.e. 360 s of transmission per rolling hour, and the
+    # firmware stops transmitting when it is used up. On LONG_FAST a message
+    # costs roughly 0.7 s (40 B) to 2.2 s (233 B) of airtime, so the sum over
+    # all bridged topics of (airtime / interval) must stay below 0.10.
+    # Example: NavSatFix (~115 B, ~1.3 s) every 30 s = 4.3 %.
+    min_interval_s: 60.0
+    topic_intervals: ["/gps/fix=30.0", "/battery_state=120.0"]
 
     # Messages larger than one LoRa packet are split into fragments. Above
     # this many fragments a message is not sent (each costs airtime and one
@@ -59,7 +73,8 @@ meshtastic_bridge_node:
     remote_namespace: "mesh"
     link_quality_topic: /mesh/link_quality
 
-    # Meshtastic settings. dest "^all" broadcasts to the whole mesh.
+    # Meshtastic settings. dest "^all" broadcasts to the whole mesh, other
+    # destinations can be selected by specifying node IDs.
     dest: "^all"
     channel_index: 0
     # 0 uses the firmware default (lora.hop_limit, normally 3).
