@@ -116,6 +116,8 @@ esptool.py --chip esp32s3 --port /dev/ttyACM0 --baud 921600 \
 
 If the board isn't detected, put it in download mode: hold **BOOT**, press and release **RST**, then release **BOOT**. Press **RST** again after flashing.
 
+**Custom board:** for the **Adaptive AgroTech Wireless Datalogger and Smart Controller v4.0** (ESP32 + SX127x), see the [board overlay and bring-up guide](variants/adaptive_agrotech_v4/README.md). The root `platformio.ini` holds its firmware overlay, which is built in a separate Meshtastic firmware checkout. One board has been flashed with Meshtastic 2.8.2; it initializes the radio and transmits on EU_868, but reception still needs a test against a second node.
+
 ## 3. Set region and preset
 
 Every board needs the same region and modem preset. A freshly flashed board won't transmit until a region is set:
