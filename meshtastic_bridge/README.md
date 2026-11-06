@@ -173,6 +173,7 @@ Defaults as in [`config/meshtastic_bridge_node.yaml`](../config/meshtastic_bridg
 | `port_num` | `PRIVATE_APP` | Meshtastic port number used by the bridge |
 | `max_payload_bytes` | `233` | LoRa payload size per packet |
 | `poll_hz` | `20.0` | How often received packets are processed and due messages sent |
+| `gps_topic` | `""` | Publish the radio's own GPS fix here as `sensor_msgs/NavSatFix` (boards with GPS, e.g. T-Beam). `""` disables it |
 
 ## Topics
 
@@ -182,6 +183,8 @@ Defaults as in [`config/meshtastic_bridge_node.yaml`](../config/meshtastic_bridg
 | `/mesh/link_quality` | `diagnostic_msgs/DiagnosticStatus` | One message per received message. `name` is the device; `values` hold `topic`, `source_topic`, `msg_seq`, `rssi`, `snr` and `hops` |
 
 `hops` is the number of relays a message passed through (`0` = direct).
+
+**GPS.** With `gps_topic` set, the bridge publishes the radio's own GPS fix there. Only the position the firmware sends to the API client at full precision is used. Copies of the radio's mesh position broadcasts are cut down to the channel's precision (13 bits ≈ 3 km here) and are ignored. The bridge never writes a position to the radio: a position packet sent to your own node replaces the node's position. `header.stamp` is the GPS fix time. `altitude` is above mean sea level, not above the WGS84 ellipsoid as `NavSatFix` specifies. The covariance is estimated from PDOP with an assumed 5 m user range error. The fix needs a clear view of the sky. Indoors a T-Beam usually has none, and nothing is published.
 
 ## Multiple devices on one network
 
@@ -198,7 +201,8 @@ The tests are ROS nodes in `scripts/tests/` that only publish and subscribe to o
 |---|---|---|---|
 | `/link_test/ping` → `/<echo>/link_test/pong` | `std_msgs/Header` | host → echo → host | Latency: the echo device republishes every ping |
 | `/link_test/data` | `std_msgs/UInt8MultiArray` | host → echo | Throughput: the echo device counts what arrives (header: run id, seq, count) |
-| `/link_test/report_request` → `/<echo>/link_test/report` | `std_msgs/String` | host → echo → host | Throughput: the echo device's counts (JSON) for one run |
+| `/link_test/report_request` → `/<echo>/link_test/report` | `std_msgs/String` | host → echo → host | Throughput: the echo device's counts (JSON) for one run, with its GPS position |
+| `/<echo>/link_test/position` | `sensor_msgs/NavSatFix` | echo → host | The echo device's GPS fix, every `position_period_s` (default 60 s), only while it has one |
 
 **Handshake.** Every host test first sends unnumbered pings every 2 s until the echo device answers (`handshake_timeout_s`, default 120 s). That gives both bridges time to discover each other's topics, so start-up losses don't count against the measurement.
 
@@ -208,17 +212,21 @@ The tests are ROS nodes in `scripts/tests/` that only publish and subscribe to o
 
 **Range.** Range isn't a separate test. Run the latency and throughput tests at each position, with a `label`. Every result carries RSSI, SNR and hop count.
 
+**GPS.** The test config sets the bridge's `gps_topic` to `/mesh/gps/fix`, so a board with GPS (T-Beam) publishes its fix there. Every result then also holds both positions (`host_lat`/`host_lon`, `peer_lat`/`peer_lon`) and the great-circle distance between them (`distance_m`), so range runs are measured, not just labelled. Latency rows use the echo device's last forwarded fix. Throughput runs use the position in the echo device's report. Fixes older than `max_fix_age_s` (default 300 s) count as no fix. Without a fix on both ends, those columns stay empty and the tests run as before. A T-Beam needs a clear view of the sky, and its first fix can take several minutes. The echo device's position messages cost airtime: one `NavSatFix` (~120 B) every 60 s is ~2 % of the duty-cycle budget on `LONG_FAST`. Raise `position_period_s` if that matters.
+
 **Duty cycle during tests.** Once a device has used its 360 s per hour, the firmware stops transmitting, and the losses you then measure come from the duty-cycle limit, not from the radio link. On `LONG_FAST`, 50 messages of 200 B already use ~100 s. The echo device spends its own budget on pongs and reports.
 
 **Result files** in `~/fleet_test_results/`:
 
 | File | Contents |
 |---|---|
-| `latency_summary.csv` | One row per latency run: label, sent/answered, RTT median/p95/max, RSSI, SNR, hops |
-| `latency_<label>_<time>.csv` | One row per ping of a run, with RSSI/SNR/hops |
-| `throughput_summary.csv` | One row per throughput run: label, size, interval, offered load, delivered, goodput, RSSI, SNR, hops |
+| `latency_summary.csv` | One row per latency run: label, sent/answered, RTT median/p95/max, RSSI, SNR, hops, distance (median/min/max) and positions |
+| `latency_<label>_<time>.csv` | One row per ping of a run, with RSSI/SNR/hops, positions and distance |
+| `throughput_summary.csv` | One row per throughput run: label, size, interval, offered load, delivered, goodput, RSSI, SNR, hops, positions and distance |
 
-**Emulated device.** `emulated_device.py` is a stand-in robot. It publishes `/emulated/battery_state`, `/emulated/gps/fix` and `/emulated/status`, and logs the same topics from other devices. Use it to try the filters and transmit-only mode.
+Summary files written by an older version of the tests get the new columns added, with blanks in the old rows.
+
+**Emulated device.** `emulated_device.py` is a stand-in robot. It publishes `/emulated/battery_state`, `/emulated/gps/fix` and `/emulated/status`, and logs the same topics from other devices. Use it to try the filters and transmit-only mode. `/emulated/gps/fix` is the radio's real GPS fix whenever there is one, otherwise a random walk around `lat`/`lon` (`use_gps:=false` always emulates).
 
 ## Package layout
 

@@ -11,9 +11,9 @@
   <exec_depend>rosidl_runtime_py</exec_depend>
   <exec_depend>diagnostic_msgs</exec_depend>
   <exec_depend>rcl_interfaces</exec_depend>
-  <!-- std_msgs and sensor_msgs are only used by the link tests in scripts/tests -->
-  <exec_depend>std_msgs</exec_depend>
+  <!-- sensor_msgs: gps_topic (NavSatFix). std_msgs is only used by the link tests -->
   <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
   <exec_depend>ament_index_python</exec_depend>

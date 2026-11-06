@@ -6,7 +6,8 @@ meshtastic_bridge_node:
     serial_port: auto
     tcp_host: ""
     connect_timeout_s: 30
-    expected_hw_model: TLORA_T3_S3
+    # The test fleet mixes T-Beams and other boards, so no model check.
+    expected_hw_model: ""
     min_firmware_version: ""
     # Set the same preset on both devices to compare presets, e.g. SHORT_FAST
     # (region EU_868) or NARROW_FAST (region EU_N_868, firmware 2.8+).
@@ -40,3 +41,6 @@ meshtastic_bridge_node:
     port_num: PRIVATE_APP
     max_payload_bytes: 233
     poll_hz: 20.0
+    # The link tests log the GPS positions of both ends (T-Beam boards) and
+    # the distance between them. Boards without GPS simply report none.
+    gps_topic: /mesh/gps/fix
