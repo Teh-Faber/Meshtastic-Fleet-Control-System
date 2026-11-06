@@ -27,8 +27,12 @@ KIND_ANNOUNCE = 1
 KIND_DATA = 2
 KIND_REQUEST = 3
 
-# TODO: verify against the firmware version in use (DATA_PAYLOAD_LEN).
-MAX_PAYLOAD_BYTES = 233
+# Largest bridge packet known to arrive. Meshtastic's DATA_PAYLOAD_LEN is 233,
+# but with PRIVATE_APP (3-byte port number) the firmware (2.7.26) rejects
+# 233 B as TOO_LARGE. It accepts 231 B, yet 231 B packets never reached the
+# other T-Beam, while 221 B ones did (link test, SHORT_FAST). The exact limit
+# lies between 221 and 231 B.
+MAX_PAYLOAD_BYTES = 221
 MAX_FRAGMENTS = 16
 
 _KIND = struct.Struct('<B')

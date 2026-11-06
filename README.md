@@ -186,7 +186,7 @@ The durations are for `SHORT_FAST` and include the bridge start and the handshak
 
 To measure range, move the remote device to each position and run the tests there with a new `label`. RSSI, SNR and hop count are recorded automatically, and so is the distance when both ends are T-Beams with a GPS fix. Results are written to `~/fleet_test_results/`.
 
-Long test series run into the 10% duty cycle and then stop transmitting. Runs past the limit keep the radio transmitting for their whole duration, so on `SHORT_FAST` budget for about two sweeps or five throughput ramps per hour. On `LONG_FAST`, sweep slower intervals and fewer sizes at a time, e.g. `SIZES=16,210 INTERVALS=8,4,2,1 scripts/sweep_throughput.sh`, and leave time between sweeps.
+Long test series run into the 10% duty cycle and then stop transmitting. Runs past the limit keep the radio transmitting for their whole duration, so on `SHORT_FAST` budget for about two sweeps or five throughput ramps per hour. On `LONG_FAST`, sweep slower intervals and fewer sizes at a time, e.g. `SIZES=16,200 INTERVALS=8,4,2,1 scripts/sweep_throughput.sh`, and leave time between sweeps.
 
 ## Troubleshooting
 

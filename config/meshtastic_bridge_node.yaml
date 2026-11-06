@@ -80,7 +80,10 @@ meshtastic_bridge_node:
     # 0 uses the firmware default (lora.hop_limit, normally 3).
     hop_limit: 0
     port_num: PRIVATE_APP
-    max_payload_bytes: 233
+    # Bridge bytes per LoRa packet. 233 (Meshtastic's DATA_PAYLOAD_LEN) is
+    # rejected by the firmware as TOO_LARGE on PRIVATE_APP; 221 is the largest
+    # size verified to arrive (see codec.MAX_PAYLOAD_BYTES).
+    max_payload_bytes: 221
     poll_hz: 20.0
 
     # Publish the radio's own GPS fix (sensor_msgs/NavSatFix), e.g. from a

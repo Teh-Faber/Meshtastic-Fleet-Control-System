@@ -5,7 +5,7 @@
 #   e.g. scripts/sweep_throughput.sh 10 label:=500m
 #        scripts/sweep_throughput.sh label:=500m        (10 s per run)
 #   The remote device just keeps running `scripts/run_test.sh echo`.
-#   Override the grid: SIZES=16,210 INTERVALS=2,1,0.5 scripts/sweep_throughput.sh
+#   Override the grid: SIZES=16,200 INTERVALS=2,1,0.5 scripts/sweep_throughput.sh
 #
 # To just find the maximum, `scripts/run_test.sh throughput` is quicker: it
 # ramps the rate up for one size and stops a couple of steps past the limit.
@@ -39,7 +39,7 @@ elif [ $# -ge 1 ] && [[ "$1" != *:=* ]]; then
     exit 1
 fi
 
-SIZES="${SIZES:-16,64,210}"
+SIZES="${SIZES:-16,64,200}"
 INTERVALS="${INTERVALS:-1.0,0.5,0.2,0.1}"
 # Seconds between runs, lets the radio's transmit queue drain.
 PAUSE_S="${PAUSE_S:-2.0}"

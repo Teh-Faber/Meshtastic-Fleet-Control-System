@@ -39,7 +39,7 @@ meshtastic_bridge_node:
     channel_index: 0
     hop_limit: 0
     port_num: PRIVATE_APP
-    max_payload_bytes: 233
+    max_payload_bytes: 221
     poll_hz: 20.0
     # The link tests log the GPS positions of both ends (T-Beam boards) and
     # the distance between them. Boards without GPS simply report none.

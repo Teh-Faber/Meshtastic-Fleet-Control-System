@@ -180,7 +180,7 @@ class BridgeNode(Node):
         self.declare_parameter('channel_index', 0)
         self.declare_parameter('hop_limit', 0)
         self.declare_parameter('port_num', 'PRIVATE_APP')
-        self.declare_parameter('max_payload_bytes', 233)
+        self.declare_parameter('max_payload_bytes', codec.MAX_PAYLOAD_BYTES)
         self.declare_parameter('poll_hz', 20.0)
         self.declare_parameter('gps_topic', '')
 

@@ -17,7 +17,7 @@ Modes:
   the maximum goodput.
 - **Single run**: ``interval_s:=0.5`` sends one run at that interval.
 - **Sweep**: ``payload_sizes`` and ``intervals`` (comma separated, e.g.
-  ``16,64,210``) run every combination, without stopping early.
+  ``16,64,200``) run every combination, without stopping early.
 
 All runs share one bridge connection, so the bridge start and the handshake
 happen once.
@@ -29,8 +29,13 @@ real limit: delivery drops and goodput levels off at what the link carries.
 When the radio's queue is full the bridge blocks until a slot frees up, and
 messages published meanwhile are overwritten and count as lost.
 
-The default size of 210 B is the largest that still fits in one LoRa packet
-(larger messages are split into fragments, and losing one loses the message).
+The default size of 200 B is the largest that still fits in one bridge
+packet (221 B with framing; larger messages are split into fragments, and
+losing one loses the message).
+
+If nothing arrives at a step before any step has succeeded, the ramp stops
+with an error: a faster rate can't help, the link or the message size is
+the problem.
 
 Logs progress while sending and one result line per run. Appends one row
 per run to ``throughput_summary.csv``, with both GPS positions and their
@@ -47,9 +52,11 @@ from link_test_common import (append_summary, DATA, DATA_HEADER, format_duration
                               parse_list, REPORT, REPORT_REQUEST, run, TopicWatcher)
 from std_msgs.msg import String, UInt8MultiArray
 
-# Ramp steps (s between messages). On SHORT_FAST a 210 B message is ~0.19 s
-# on air, so the radio saturates around 0.2 s and 0.05 s offers ~4x its
-# capacity. On LONG_FAST (~2 s per message) it saturates at the first step.
+# Ramp steps (s between messages). The T-Beam sends a few packets per second
+# at most on SHORT_FAST (its queue drains slowly and the Meshtastic Python
+# library sleeps 0.1 s per write), so it saturates around 0.3 s and 0.05 s
+# offers several times its capacity. On LONG_FAST (~2 s on air per 200 B
+# message) it saturates at the first step.
 RAMP_INTERVALS = [1.0, 0.5, 0.3, 0.2, 0.15, 0.1, 0.05]
 # Goodput must rise by more than this to count as "still rising".
 RAMP_GAIN = 1.05
@@ -70,7 +77,7 @@ class ThroughputTest(HostTest):
         self.fixed_count = self.param('count', 0)
         self.duration_s = self.param('duration_s', 10.0)
         sizes = parse_list(self.param('payload_sizes', ''), int) or \
-            [self.param('payload_size', 210)]
+            [self.param('payload_size', 200)]
         intervals = parse_list(self.param('intervals', ''), float)
         interval_s = self.param('interval_s', 0.0)
         if intervals:
@@ -224,9 +231,18 @@ class ThroughputTest(HostTest):
     def update_ramp(self, row):
         """Track the best goodput per size; stop a size's ramp once past the limit."""
         size = row['payload_size']
-        ramp = self.ramp.setdefault(size, {'best': None, 'beyond': 0, 'done': False})
-        goodput = row['goodput_Bps'] or 0.0
+        ramp = self.ramp.setdefault(
+            size, {'best': None, 'beyond': 0, 'done': False, 'failed': False})
         best = ramp['best']
+        if not row['received'] and best is None:
+            # Nothing has arrived at this size yet, at the slowest rate so far.
+            ramp['done'] = ramp['failed'] = True
+            self.get_logger().error(
+                f'Nothing arrived at {row["interval_s"]}s intervals, the slowest step: a '
+                'faster rate cannot help. Check that the echo device is running and in '
+                f'range, and that {size} B messages fit (try payload_size:=100)')
+            return
+        goodput = row['goodput_Bps'] or 0.0
         best_goodput = (best['goodput_Bps'] or 0.0) if best else 0.0
         if best is None or goodput > best_goodput * RAMP_GAIN:
             ramp['best'], ramp['beyond'] = row, 0
@@ -295,6 +311,9 @@ class ThroughputTest(HostTest):
                          f'{row["goodput_Bps"] or "-"} B/s')
         for size, ramp in self.ramp.items():
             best = ramp['best']
+            if ramp['failed']:
+                log.error(f'No goodput measured ({size} B messages): nothing arrived')
+                continue
             if best is None:
                 continue
             if ramp['beyond']:
