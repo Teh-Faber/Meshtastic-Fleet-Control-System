@@ -204,17 +204,19 @@ The tests are ROS nodes in `scripts/tests/` that only publish and subscribe to o
 | `/link_test/report_request` → `/<echo>/link_test/report` | `std_msgs/String` | host → echo → host | Throughput: the echo device's counts (JSON) for one run, with its GPS position |
 | `/<echo>/link_test/position` | `sensor_msgs/NavSatFix` | echo → host | The echo device's GPS fix, every `position_period_s` (default 60 s), only while it has one |
 
-**Handshake.** Every host test first sends unnumbered pings every 2 s until the echo device answers (`handshake_timeout_s`, default 120 s). That gives both bridges time to discover each other's topics, so start-up losses don't count against the measurement.
+**Handshake.** Every host test first sends unnumbered pings every 2 s until the echo device answers (`handshake_timeout_s`, default 60 s). That gives both bridges time to discover each other's topics, so start-up losses don't count against the measurement. Every 10 s it logs how far it got: no pong topic from another device yet (the echo device isn't running or isn't heard), or pong topic found but no answer yet.
 
-**Latency.** RTT is measured on the host's clock, so the devices' clocks don't need to be synced. Link quality is that of the pongs (echo → host).
+**Latency.** One ping is in flight at a time. The next one goes out as soon as the previous one is answered or times out (`timeout_s`, default 10 s), but never sooner than `interval_s` (default 1 s) after the previous ping. A run of `count` pings (default 20) therefore takes about `count` × RTT. Pings never queue up in the radio behind each other, which would add queueing delay to the RTT. RTT is measured on the host's clock, so the devices' clocks don't need to be synced. Link quality is that of the pongs (echo → host). Each ping is logged with its RTT, RSSI, SNR, hops and the expected time left.
 
-**Throughput.** The host sends `count` messages, then repeats a report request until the echo device answers (`report_timeout_s`). Goodput is the bytes received divided by the time between the first and last message received, measured on the echo device. Link quality is measured by the echo device (host → echo). The bridge keeps only the latest message per topic, so anything published faster than the radio can send is overwritten and counts as lost.
+**Throughput.** A run sends `count` messages (default 20) of `payload_size` bytes every `interval_s`. It then repeats a report request until the echo device answers (`report_timeout_s`, default 30 s). Goodput is the bytes received after the first message, divided by the time between the first and last message received, measured on the echo device. Leaving out the first message's bytes keeps short runs from overstating it: the span covers only *n*−1 intervals. Link quality is measured by the echo device (host → echo). The bridge keeps only the latest message per topic, so anything published faster than the radio can send is overwritten and counts as lost.
+
+**Sweeps.** With `payload_sizes` and `intervals` (comma separated) one throughput process runs every combination one after the other, `pause_s` (default 2 s) apart, over the same bridge connection. The bridge start and the handshake happen once, not once per combination. Each run has its own run id and its own summary row (`status`: `ok`, `no_report`, or `interrupted` on Ctrl+C). A run without a report doesn't stop the sweep. `scripts/sweep_throughput.sh` is a wrapper with a default grid of 3 sizes × 4 intervals (~3 min on `SHORT_FAST`).
 
 **Range.** Range isn't a separate test. Run the latency and throughput tests at each position, with a `label`. Every result carries RSSI, SNR and hop count.
 
 **GPS.** The test config sets the bridge's `gps_topic` to `/mesh/gps/fix`, so a board with GPS (T-Beam) publishes its fix there. Every result then also holds both positions (`host_lat`/`host_lon`, `peer_lat`/`peer_lon`) and the great-circle distance between them (`distance_m`), so range runs are measured, not just labelled. Latency rows use the echo device's last forwarded fix. Throughput runs use the position in the echo device's report. Fixes older than `max_fix_age_s` (default 300 s) count as no fix. Without a fix on both ends, those columns stay empty and the tests run as before. A T-Beam needs a clear view of the sky, and its first fix can take several minutes. The echo device's position messages cost airtime: one `NavSatFix` (~120 B) every 60 s is ~2 % of the duty-cycle budget on `LONG_FAST`. Raise `position_period_s` if that matters.
 
-**Duty cycle during tests.** Once a device has used its 360 s per hour, the firmware stops transmitting, and the losses you then measure come from the duty-cycle limit, not from the radio link. On `LONG_FAST`, 50 messages of 200 B already use ~100 s. The echo device spends its own budget on pongs and reports.
+**Duty cycle during tests.** Once a device has used its 360 s per hour, the firmware stops transmitting, and the losses you then measure come from the duty-cycle limit, not from the radio link. On `LONG_FAST`, 20 messages of 200 B already use ~40 s, and a sweep's fast intervals keep the radio busy the whole time. The echo device spends its own budget on pongs and reports.
 
 **Result files** in `~/fleet_test_results/`:
 
@@ -222,7 +224,7 @@ The tests are ROS nodes in `scripts/tests/` that only publish and subscribe to o
 |---|---|
 | `latency_summary.csv` | One row per latency run: label, sent/answered, RTT median/p95/max, RSSI, SNR, hops, distance (median/min/max) and positions |
 | `latency_<label>_<time>.csv` | One row per ping of a run, with RSSI/SNR/hops, positions and distance |
-| `throughput_summary.csv` | One row per throughput run: label, size, interval, offered load, delivered, goodput, RSSI, SNR, hops, positions and distance |
+| `throughput_summary.csv` | One row per throughput run (a sweep writes one per combination): label, size, interval, offered load, delivered, goodput, RSSI, SNR, hops, positions, distance and status |
 
 Summary files written by an older version of the tests get the new columns added, with blanks in the old rows.
 

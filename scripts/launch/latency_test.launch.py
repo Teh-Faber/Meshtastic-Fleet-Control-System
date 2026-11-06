@@ -2,7 +2,7 @@
 Launch the bridge and the latency test on the host. The peer runs echo_device.launch.py.
 
 Run with:
-  ros2 launch meshtastic_bridge latency_test.launch.py label:=500m count:=50
+  ros2 launch meshtastic_bridge latency_test.launch.py label:=500m count:=20
 """
 
 import os
@@ -19,10 +19,12 @@ SCRIPT = 'latency_test.py'
 # Test parameters exposed as launch arguments: name -> default.
 TEST_ARGS = {
     'label': 'unlabeled',
-    'count': '50',
-    'interval_s': '5.0',
-    'timeout_s': '30.0',
+    'count': '20',
+    # Minimum time between pings; the next one goes out once the previous is answered.
+    'interval_s': '1.0',
+    'timeout_s': '10.0',
     'payload_size': '0',
+    'handshake_timeout_s': '60.0',
     'output_dir': '~/fleet_test_results',
 }
 
