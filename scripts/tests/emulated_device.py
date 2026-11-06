@@ -6,6 +6,10 @@ Publishes ``<root>/battery_state``, ``<root>/gps/fix`` and ``<root>/status``
 the way a real robot would, and logs the same topics arriving from other
 devices (``/<device><root>/...``). Use it to check end-to-end integration
 and the include/exclude filters, or as a stand-in peer while developing.
+
+``gps/fix`` is the radio's real GPS fix (T-Beam, via the bridge's
+``gps_topic``) whenever there is one, otherwise a random walk around
+``lat``/``lon``. ``use_gps:=false`` always emulates.
 """
 
 import math
@@ -24,6 +28,8 @@ class EmulatedDevice(LinkTestNode):
         self.period_s = self.param('publish_period_s', 10.0)
         self.lat = self.param('lat', 55.3673)
         self.lon = self.param('lon', 10.4316)
+        self.use_gps = self.param('use_gps', True)
+        self.fix_source = None
 
         self.battery = 1.0
         self.received = {}
@@ -49,11 +55,26 @@ class EmulatedDevice(LinkTestNode):
         self.battery_pub.publish(BatteryState(header=self._header(now), percentage=self.battery,
                                               voltage=float('nan'), present=True))
 
-        # Wander a few metres around the configured position.
-        self.lat += random.uniform(-2e-5, 2e-5)
-        self.lon += random.uniform(-2e-5, 2e-5) / math.cos(math.radians(self.lat))
-        fix = NavSatFix(header=self._header(now), latitude=self.lat, longitude=self.lon)
-        fix.status.status = NavSatStatus.STATUS_FIX
+        real = self.gps.position(self.max_fix_age_s) if self.use_gps else None
+        if real:
+            fix = NavSatFix(header=self.gps.latest.header, latitude=real['lat'],
+                            longitude=real['lon'], altitude=self.gps.latest.altitude,
+                            status=self.gps.latest.status,
+                            position_covariance=self.gps.latest.position_covariance,
+                            position_covariance_type=self.gps.latest.position_covariance_type)
+            fix.header.frame_id = 'base_link'
+            # Continue the random walk from here if the fix is lost.
+            self.lat, self.lon = real['lat'], real['lon']
+        else:
+            # Wander a few metres around the configured position.
+            self.lat += random.uniform(-2e-5, 2e-5)
+            self.lon += random.uniform(-2e-5, 2e-5) / math.cos(math.radians(self.lat))
+            fix = NavSatFix(header=self._header(now), latitude=self.lat, longitude=self.lon)
+            fix.status.status = NavSatStatus.STATUS_FIX
+        source = 'GPS' if real else 'emulated'
+        if source != self.fix_source:
+            self.get_logger().info(f'Publishing {source} position on {self.fix_pub.topic_name}')
+            self.fix_source = source
         self.fix_pub.publish(fix)
 
         self.status_pub.publish(String(data='ok' if self.battery > 0.2 else 'low_battery'))

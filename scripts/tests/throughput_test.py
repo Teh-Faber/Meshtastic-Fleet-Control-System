@@ -12,7 +12,9 @@ faster than the radio can send are overwritten and count as lost. Finding
 that point is the goal of this test; sweep it with
 scripts/sweep_throughput.sh. Mind the EU868 duty-cycle limits.
 
-Appends a one-line result to ``throughput_summary.csv``.
+Appends a one-line result to ``throughput_summary.csv``, with both GPS
+positions and their distance when the T-Beams have a fix (the echo device's
+position comes with its report).
 """
 
 import json
@@ -103,11 +105,13 @@ class ThroughputTest(HostTest):
             'rssi_mean': report.get('rssi_mean'),
             'snr_mean': report.get('snr_mean'),
             'hops': report.get('hops'),
+            **self.position_fields(report.get('position')),
         }
         path = append_summary(self.output_dir, 'throughput', row)
         self.get_logger().info(
             f'Delivered {received}/{self.seq}, goodput {row["goodput_Bps"]} B/s, '
-            f'rssi {row["rssi_mean"]} snr {row["snr_mean"]}. Summary in {path}')
+            f'rssi {row["rssi_mean"]} snr {row["snr_mean"]}, distance {row["distance_m"]} m. '
+            f'Summary in {path}')
 
 
 def main(args=None):

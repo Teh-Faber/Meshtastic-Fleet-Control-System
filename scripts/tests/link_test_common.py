@@ -7,6 +7,11 @@ publish and subscribe to ordinary ROS topics under ``/link_test`` and let
 their bridges carry them, so the tests cover the whole path. Topics from the
 other device appear locally as ``/<device>/link_test/...``, which
 ``TopicWatcher`` discovers at runtime.
+
+GPS: each bridge publishes its radio's own fix on ``gps_topic`` (T-Beam
+boards). The echo device forwards its fix on ``/link_test/position``, so
+host results carry both positions and the distance between the two ends.
+Boards without GPS just leave those columns empty.
 """
 
 import collections
@@ -22,6 +27,7 @@ from diagnostic_msgs.msg import DiagnosticStatus
 from rcl_interfaces.msg import ParameterDescriptor
 import rclpy
 from rclpy.node import Node
+from sensor_msgs.msg import NavSatFix, NavSatStatus
 from std_msgs.msg import Header
 
 ROOT = '/link_test'
@@ -30,6 +36,11 @@ PONG = f'{ROOT}/pong'                      # echo -> host, std_msgs/Header
 DATA = f'{ROOT}/data'                      # host -> echo, std_msgs/UInt8MultiArray
 REPORT_REQUEST = f'{ROOT}/report_request'  # host -> echo, std_msgs/String (run id)
 REPORT = f'{ROOT}/report'                  # echo -> host, std_msgs/String (JSON)
+POSITION = f'{ROOT}/position'              # echo -> host, sensor_msgs/NavSatFix
+
+# Where the local bridge publishes the radio's GPS fix (bridge gps_topic).
+GPS_TOPIC = '/mesh/gps/fix'
+EARTH_RADIUS_M = 6371008.8
 
 # Start of every DATA payload: run id, seq, number of messages in the run.
 DATA_HEADER = struct.Struct('<HII')
@@ -47,6 +58,9 @@ class LinkTestNode(Node):
         super().__init__(name)
         self.done = False
         self.output_dir = os.path.expanduser(self.param('output_dir', '~/fleet_test_results'))
+        # Fixes older than this are treated as no fix.
+        self.max_fix_age_s = self.param('max_fix_age_s', 300.0)
+        self.gps = GpsFix(self, self.param('gps_topic', GPS_TOPIC))
 
     def param(self, name, default):
         """Declare ``name`` and return its value cast to the type of ``default``."""
@@ -79,6 +93,9 @@ class HostTest(LinkTestNode):
         self.link = LinkQuality(self, self.param('link_quality_topic', '/mesh/link_quality'))
         self.ping_pub = self.create_publisher(Header, PING, 10)
         self.pong_watcher = TopicWatcher(self, PONG, Header, self._on_pong)
+        self.peer_fixes = {}  # device -> latest NavSatFix it forwarded
+        self.position_watcher = TopicWatcher(
+            self, POSITION, NavSatFix, lambda d, m: self.peer_fixes.__setitem__(d, m))
 
         self._t_handshake = time.monotonic()
         self._handshake_timer = self.create_timer(2.0, self._handshake_tick)
@@ -123,6 +140,26 @@ class HostTest(LinkTestNode):
     def on_pong(self, device, seq):
         """Handle the pong for numbered ping ``seq``."""
 
+    def peer_position(self):
+        """Return the peer's latest forwarded fix as a dict, or None."""
+        return fix_to_dict(self.peer_fixes.get(self.peer), self.max_fix_age_s)
+
+    def position_fields(self, peer_pos=None):
+        """
+        Host and peer position plus the distance between them, for a result row.
+
+        ``peer_pos`` defaults to the fix the echo device last forwarded.
+        """
+        host = self.gps.position(self.max_fix_age_s)
+        peer = peer_pos if peer_pos is not None else self.peer_position()
+        return {
+            'host_lat': host and round(host['lat'], 7),
+            'host_lon': host and round(host['lon'], 7),
+            'peer_lat': peer and round(peer['lat'], 7),
+            'peer_lon': peer and round(peer['lon'], 7),
+            'distance_m': round(distance_m(host, peer), 1) if host and peer else None,
+        }
+
     def link_summary(self, source_topic):
         """Return mean RSSI/SNR and last hop count seen from the peer on ``source_topic``."""
         samples = self.link.history.get((self.peer, source_topic), [])
@@ -146,6 +183,47 @@ class LinkQuality:
 
     def get(self, device, source_topic):
         return self.latest.get((device, source_topic), {})
+
+
+class GpsFix:
+    """Latest GPS fix of the local radio, as published by the bridge."""
+
+    def __init__(self, node, topic):
+        self.latest = None
+        # Best effort matches the bridge's reliable publisher too.
+        node.create_subscription(NavSatFix, topic, self._on_fix, 10)
+
+    def _on_fix(self, msg):
+        if msg.status.status >= NavSatStatus.STATUS_FIX:
+            self.latest = msg
+
+    def position(self, max_age_s):
+        return fix_to_dict(self.latest, max_age_s)
+
+
+def fix_to_dict(fix, max_age_s):
+    """
+    ``{'lat', 'lon', 'alt', 'age_s'}`` of a NavSatFix, or None if missing or stale.
+
+    The age compares the GPS fix time with this machine's clock, so it is
+    only as good as the local clock (NTP keeps it well within a second).
+    """
+    if fix is None or fix.status.status < NavSatStatus.STATUS_FIX:
+        return None
+    age = time.time() - (fix.header.stamp.sec + fix.header.stamp.nanosec * 1e-9)
+    if age > max_age_s:
+        return None
+    return {'lat': fix.latitude, 'lon': fix.longitude,
+            'alt': None if math.isnan(fix.altitude) else fix.altitude, 'age_s': max(0.0, age)}
+
+
+def distance_m(a, b):
+    """Great-circle distance in metres between two ``{'lat', 'lon'}`` dicts."""
+    lat1, lat2 = math.radians(a['lat']), math.radians(b['lat'])
+    dlat = lat2 - lat1
+    dlon = math.radians(b['lon'] - a['lon'])
+    h = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+    return 2 * EARTH_RADIUS_M * math.asin(math.sqrt(min(1.0, h)))
 
 
 class TopicWatcher:
@@ -196,15 +274,33 @@ class CsvLog:
 
 
 def append_summary(output_dir, test_name, row):
-    """Append one result row to ``<test_name>_summary.csv``, one row per run."""
+    """
+    Append one result row to ``<test_name>_summary.csv``, one row per run.
+
+    If the file was written with other columns (an older version of the
+    tests), it is rewritten with the union of both, old rows left blank.
+    """
     os.makedirs(output_dir, exist_ok=True)
     path = os.path.join(output_dir, f'{test_name}_summary.csv')
-    is_new = not os.path.exists(path)
+    if os.path.exists(path):
+        with open(path, newline='') as f:
+            reader = csv.DictReader(f)
+            old_columns = reader.fieldnames or []
+            old_rows = list(reader) if set(row) - set(old_columns) else None
+        if old_rows is not None:
+            columns = old_columns + [c for c in row if c not in old_columns]
+            with open(path, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=columns)
+                writer.writeheader()
+                writer.writerows(old_rows)
+        else:
+            columns = old_columns
+    else:
+        columns = list(row)
+        with open(path, 'w', newline='') as f:
+            csv.DictWriter(f, fieldnames=columns).writeheader()
     with open(path, 'a', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=list(row))
-        if is_new:
-            writer.writeheader()
-        writer.writerow(row)
+        csv.DictWriter(f, fieldnames=columns, extrasaction='ignore').writerow(row)
     return path
 
 

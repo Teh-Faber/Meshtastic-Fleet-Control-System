@@ -20,6 +20,8 @@ DEVICE_ARGS = {
     'publish_period_s': '10.0',
     'lat': '55.3673',
     'lon': '10.4316',
+    # Publish the radio's real GPS fix when there is one (T-Beam).
+    'use_gps': 'true',
 }
 
 

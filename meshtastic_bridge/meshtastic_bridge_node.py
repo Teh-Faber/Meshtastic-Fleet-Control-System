@@ -10,6 +10,10 @@ type under ``/<remote_namespace>/<device_name>/<topic>``, e.g.
 ``/drone1/gps/fix``. Link quality for every received message is published
 on ``link_quality_topic``.
 
+GPS: with ``gps_topic`` set, the radio's own GPS fix (e.g. a T-Beam's) is
+published there as ``sensor_msgs/NavSatFix``. The firmware reports it to
+the API client on its own timer; positions are only read, never written.
+
 Every device runs the same node. ``rx_enabled: false`` makes a device
 transmit only (e.g. an autonomous drone that never needs fleet data), and
 ``tx_enabled: false`` makes it listen only. Received traffic can be limited
@@ -39,11 +43,16 @@ import meshtastic.util
 from meshtastic_bridge import codec
 from pubsub import pub
 import rclpy
+from rclpy.exceptions import ParameterUninitializedException
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from rclpy.serialization import deserialize_message
 from rosidl_runtime_py.utilities import get_message
+from sensor_msgs.msg import NavSatFix, NavSatStatus
+
+# Assumed GPS user range error (m), used to turn PDOP into a covariance.
+GPS_UERE_M = 5.0
 
 
 def sanitize_name(name):
@@ -70,6 +79,46 @@ def version_tuple(version):
         digits = re.match(r'\d+', part)
         parts.append(int(digits.group()) if digits else 0)
     return tuple(parts)
+
+
+def position_to_navsatfix(position, now_s, frame_id='gps'):
+    """
+    Convert a Meshtastic position dict into a ``NavSatFix``.
+
+    Returns None if the position has no coordinates or is reduced in
+    precision (``precisionBits`` < 32, as in copies of mesh broadcasts).
+    The stamp is the GPS fix time if the position has one, else ``now_s``.
+    Altitude is Meshtastic's (above mean sea level), not the WGS84 ellipsoid
+    altitude ``NavSatFix`` specifies; the two differ by the geoid separation.
+    """
+    if 'latitudeI' not in position or 'longitudeI' not in position:
+        return None
+    precision = position.get('precisionBits')
+    if precision is not None and precision < 32:
+        return None
+    lat = position['latitudeI'] * 1e-7
+    lon = position['longitudeI'] * 1e-7
+    if lat == 0.0 and lon == 0.0:
+        return None  # firmware placeholder for "no position"
+    fix = NavSatFix(latitude=lat, longitude=lon)
+    fix.altitude = float(position['altitude']) if 'altitude' in position else float('nan')
+    stamp = float(position.get('time') or now_s)
+    fix.header.stamp.sec = int(stamp)
+    fix.header.stamp.nanosec = int((stamp % 1.0) * 1e9)
+    fix.header.frame_id = frame_id
+    fix.status.status = NavSatStatus.STATUS_FIX
+    fix.status.service = NavSatStatus.SERVICE_GPS
+    pdop = position.get('PDOP')
+    if pdop:
+        # Firmware sends DOP x 100.
+        sigma = pdop / 100.0 * GPS_UERE_M
+        fix.position_covariance = [sigma ** 2, 0.0, 0.0,
+                                   0.0, sigma ** 2, 0.0,
+                                   0.0, 0.0, (2.0 * sigma) ** 2]
+        fix.position_covariance_type = NavSatFix.COVARIANCE_TYPE_APPROXIMATED
+    else:
+        fix.position_covariance_type = NavSatFix.COVARIANCE_TYPE_UNKNOWN
+    return fix
 
 
 class TxTopic:
@@ -133,6 +182,7 @@ class BridgeNode(Node):
         self.declare_parameter('port_num', 'PRIVATE_APP')
         self.declare_parameter('max_payload_bytes', 233)
         self.declare_parameter('poll_hz', 20.0)
+        self.declare_parameter('gps_topic', '')
 
         self.serial_port = self.param('serial_port')
         self.tcp_host = self.param('tcp_host')
@@ -178,6 +228,9 @@ class BridgeNode(Node):
         # They only push onto this queue; poll() drains it on the executor.
         self._inbox = queue.Queue()
         self.interface = None
+        self.my_node_num = None
+        self.gps_pub = None
+        self.last_fix_key = None
         pub.subscribe(self._on_receive, 'meshtastic.receive')
         pub.subscribe(self._on_connection_lost, 'meshtastic.connection.lost')
         self.connect()
@@ -187,6 +240,11 @@ class BridgeNode(Node):
             self.link_pub = self.create_publisher(
                 DiagnosticStatus, self.param('link_quality_topic'), 10)
             self.own_topics.add(self.link_pub.topic_name)
+        gps_topic = self.param('gps_topic')
+        if gps_topic:
+            self.gps_pub = self.create_publisher(NavSatFix, gps_topic, 10)
+            self.own_topics.add(self.gps_pub.topic_name)
+            self.publish_own_position()
         self.create_timer(1.0 / self.param('poll_hz'), self.poll)
         if self.tx_enabled:
             self.create_timer(self.param('scan_period_s'), self.scan_topics)
@@ -197,7 +255,13 @@ class BridgeNode(Node):
             f'rx {"on" if self.rx_enabled else "off"})')
 
     def param(self, name):
-        return self.get_parameter(name).value
+        """Return a parameter's value, or None for a typed parameter left unset."""
+        try:
+            return self.get_parameter(name).value
+        except ParameterUninitializedException:
+            # Humble raises for parameters declared with a type but no value,
+            # e.g. block_devices when the config leaves it out.
+            return None
 
     def parse_intervals(self, entries):
         """Parse ``topic_intervals`` entries of the form ``"<pattern>=<seconds>"``."""
@@ -322,7 +386,9 @@ class BridgeNode(Node):
         Returns the device's LoRa config, or None if it could not be read.
         """
         log = self.get_logger()
-        user = (self.interface.getMyNodeInfo() or {}).get('user', {})
+        my_info = self.interface.getMyNodeInfo() or {}
+        self.my_node_num = my_info.get('num')
+        user = my_info.get('user', {})
         hw_model = user.get('hwModel', 'UNKNOWN')
         metadata = getattr(self.interface, 'metadata', None)
         firmware = getattr(metadata, 'firmware_version', '') or 'unknown'
@@ -381,8 +447,13 @@ class BridgeNode(Node):
             self.get_logger().error(f'sendData failed: {e}', throttle_duration_sec=5.0)
 
     def _on_receive(self, packet, interface):
-        if packet.get('decoded', {}).get('portnum') == self.port_name:
+        portnum = packet.get('decoded', {}).get('portnum')
+        if portnum == self.port_name:
             self._inbox.put(('rx', packet))
+        elif (portnum == 'POSITION_APP' and self.gps_pub is not None
+              and packet.get('from') == self.my_node_num):
+            # Our own position, sent by the firmware to the API client.
+            self._inbox.put(('pos', packet['decoded'].get('position', {})))
 
     def _on_connection_lost(self, interface):
         self._inbox.put(('lost', None))
@@ -452,6 +523,34 @@ class BridgeNode(Node):
         for topic in self.tx_topics.values():
             self.announce(topic)
 
+    # --- GPS: the radio's own position -------------------------------------
+
+    def publish_own_position(self):
+        """Publish the position the device reported on connect, if any."""
+        if self.interface is None:
+            return
+        position = (self.interface.getMyNodeInfo() or {}).get('position')
+        if position:
+            self.publish_position(position)
+        else:
+            self.get_logger().info(
+                'Device has no GPS position yet; gps_topic is published once it gets a fix')
+
+    def publish_position(self, position):
+        fix = position_to_navsatfix(position, time.time())
+        if fix is None:
+            return
+        # The firmware repeats the same fix; only publish new ones.
+        key = (fix.header.stamp.sec, fix.latitude, fix.longitude)
+        if key == self.last_fix_key:
+            return
+        if self.last_fix_key is None:
+            self.get_logger().info(
+                f'GPS fix {fix.latitude:.6f},{fix.longitude:.6f}, publishing on '
+                f'{self.gps_pub.topic_name}')
+        self.last_fix_key = key
+        self.gps_pub.publish(fix)
+
     # --- RX: mesh -> local topics ----------------------------------------
 
     def poll(self):
@@ -463,6 +562,8 @@ class BridgeNode(Node):
                 break
             if kind == 'rx':
                 self.handle_packet(packet)
+            elif kind == 'pos':
+                self.publish_position(packet)
             elif kind == 'lost':
                 self.get_logger().error('Lost connection to Meshtastic device')
                 self.interface = None

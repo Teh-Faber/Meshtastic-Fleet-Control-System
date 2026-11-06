@@ -82,3 +82,11 @@ meshtastic_bridge_node:
     port_num: PRIVATE_APP
     max_payload_bytes: 233
     poll_hz: 20.0
+
+    # Publish the radio's own GPS fix (sensor_msgs/NavSatFix), e.g. from a
+    # T-Beam's GPS. Empty disables it. The firmware reports the position on
+    # its own timer, independent of position.gps_update_interval broadcasts;
+    # nothing is sent into the mesh for it. Keep it under an excluded prefix
+    # (/mesh/*) unless you want the bridge to send it to other devices.
+    gps_topic: ""
+

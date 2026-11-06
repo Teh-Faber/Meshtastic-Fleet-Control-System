@@ -5,10 +5,12 @@ Summarize the link test results.
 Usage: python3 scripts/analyze_results.py [results dir, default ~/fleet_test_results]
 
 Prints latency_summary.csv and throughput_summary.csv as tables (one row
-per run, grouped by label), followed by per-ping RTT and link statistics for
-each latency_*.csv run log. Uses only the standard library.
+per run, grouped by label), followed by per-ping RTT, link and GPS distance
+statistics for each latency_*.csv run log. distance_m is the GPS distance
+between host and echo device (empty without a fix on both T-Beams). Uses
+only the standard library.
 
-TODO: plot RTT and goodput against label/distance for the report.
+TODO: plot RTT and goodput against distance for the report.
 """
 
 import argparse
@@ -49,6 +51,10 @@ def summarize_run(rows):
         p95 = rtts[max(0, math.ceil(0.95 * len(rtts)) - 1)]
         line += (f', RTT mean {statistics.fmean(rtts):.0f} median '
                  f'{statistics.median(rtts):.0f} p95 {p95:.0f} ms')
+    distances = floats(rows, 'distance_m')
+    if distances:
+        line += (f', distance median {statistics.median(distances):.0f} m '
+                 f'({min(distances):.0f}-{max(distances):.0f})')
     rssi, snr = floats(rows, 'rssi'), floats(rows, 'snr')
     if rssi:
         line += f', RSSI {statistics.fmean(rssi):.1f}'
@@ -65,10 +71,11 @@ def main():
 
     tables = {
         'latency_summary.csv': ['label', 'time', 'payload_size', 'sent', 'answered', 'pdr',
-                                'rtt_median_ms', 'rtt_p95_ms', 'rssi_mean', 'snr_mean', 'hops'],
+                                'rtt_median_ms', 'rtt_p95_ms', 'rssi_mean', 'snr_mean', 'hops',
+                                'distance_m'],
         'throughput_summary.csv': ['label', 'time', 'payload_size', 'interval_s', 'offered_Bps',
                                    'sent', 'received', 'pdr', 'goodput_Bps', 'rssi_mean',
-                                   'snr_mean', 'hops'],
+                                   'snr_mean', 'hops', 'distance_m'],
     }
     for name, columns in tables.items():
         path = os.path.join(args.results_dir, name)
