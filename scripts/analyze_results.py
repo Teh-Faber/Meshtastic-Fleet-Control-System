@@ -75,7 +75,7 @@ def main():
                                 'distance_m'],
         'throughput_summary.csv': ['label', 'time', 'payload_size', 'interval_s', 'offered_Bps',
                                    'sent', 'received', 'pdr', 'goodput_Bps', 'rssi_mean',
-                                   'snr_mean', 'hops', 'distance_m'],
+                                   'snr_mean', 'hops', 'distance_m', 'status'],
     }
     for name, columns in tables.items():
         path = os.path.join(args.results_dir, name)

@@ -3,6 +3,7 @@ Launch the bridge and the throughput test on the host. The peer runs echo_device
 
 Run with:
   ros2 launch meshtastic_bridge throughput_test.launch.py label:=500m payload_size:=200
+  ros2 launch meshtastic_bridge throughput_test.launch.py payload_sizes:=16,200 intervals:=1,0.5
 """
 
 import os
@@ -19,9 +20,16 @@ SCRIPT = 'throughput_test.py'
 # Test parameters exposed as launch arguments: name -> default.
 TEST_ARGS = {
     'label': 'unlabeled',
-    'count': '50',
-    'interval_s': '2.0',
+    'count': '20',
+    'interval_s': '1.0',
     'payload_size': '200',
+    # Comma lists for a sweep over every combination, e.g. 16,64,200.
+    # '' runs payload_size every interval_s once.
+    'payload_sizes': "''",
+    'intervals': "''",
+    'pause_s': '2.0',
+    'report_timeout_s': '30.0',
+    'handshake_timeout_s': '60.0',
     'output_dir': '~/fleet_test_results',
 }
 

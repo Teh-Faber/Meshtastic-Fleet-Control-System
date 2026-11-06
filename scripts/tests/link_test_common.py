@@ -19,6 +19,7 @@ import csv
 import math
 import os
 import secrets
+import signal
 import statistics
 import struct
 import time
@@ -26,7 +27,9 @@ import time
 from diagnostic_msgs.msg import DiagnosticStatus
 from rcl_interfaces.msg import ParameterDescriptor
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
+from rclpy.signals import SignalHandlerOptions
 from sensor_msgs.msg import NavSatFix, NavSatStatus
 from std_msgs.msg import Header
 
@@ -44,6 +47,9 @@ EARTH_RADIUS_M = 6371008.8
 
 # Start of every DATA payload: run id, seq, number of messages in the run.
 DATA_HEADER = struct.Struct('<HII')
+
+HANDSHAKE_PERIOD_S = 2.0
+HANDSHAKE_LOG_S = 10.0
 
 
 class LinkTestNode(Node):
@@ -79,14 +85,14 @@ class HostTest(LinkTestNode):
     Starts with a handshake: unnumbered pings every 2 s until the echo device
     answers. That also gives both bridges time to discover and announce the
     test topics, so the measured part of the test starts on a warm link.
-    Then ``start()`` is called.
+    Then ``start()`` is called. While waiting it logs what it is waiting for.
     """
 
     def __init__(self, name):
         super().__init__(name)
         # Free text stored with the results, e.g. "500m" or "relay_1hop".
         self.label = self.param('label', '')
-        self.handshake_timeout_s = self.param('handshake_timeout_s', 120.0)
+        self.handshake_timeout_s = self.param('handshake_timeout_s', 60.0)
 
         self.run_id = secrets.randbits(16)
         self.peer = None
@@ -98,8 +104,10 @@ class HostTest(LinkTestNode):
             self, POSITION, NavSatFix, lambda d, m: self.peer_fixes.__setitem__(d, m))
 
         self._t_handshake = time.monotonic()
-        self._handshake_timer = self.create_timer(2.0, self._handshake_tick)
-        self.get_logger().info('Waiting for the echo device...')
+        self._t_handshake_log = self._t_handshake
+        self._handshake_timer = self.create_timer(HANDSHAKE_PERIOD_S, self._handshake_tick)
+        self.get_logger().info(
+            f'Waiting for the echo device (up to {self.handshake_timeout_s:.0f}s)...')
 
     def publish_ping(self, tag, pad_to=0):
         msg = Header(frame_id=f'{self.run_id}:{tag}:'.ljust(pad_to, '.'))
@@ -107,12 +115,26 @@ class HostTest(LinkTestNode):
         self.ping_pub.publish(msg)
 
     def _handshake_tick(self):
-        if time.monotonic() - self._t_handshake > self.handshake_timeout_s:
+        now = time.monotonic()
+        waited = now - self._t_handshake
+        if waited > self.handshake_timeout_s:
             self.get_logger().error(
-                f'No answer from an echo device within {self.handshake_timeout_s:.0f}s')
+                f'No answer from an echo device within {self.handshake_timeout_s:.0f}s. '
+                'Is `run_test.sh echo` running on the other device, with the same LoRa '
+                'region and preset?')
             self._handshake_timer.cancel()
             self.done = True
             return
+        if now - self._t_handshake_log >= HANDSHAKE_LOG_S:
+            self._t_handshake_log = now
+            # Say how far discovery got, so a stuck handshake can be diagnosed.
+            if not self.pong_watcher.subs:
+                stage = 'no pong topic from another device yet'
+            else:
+                stage = 'pong topic found, waiting for an answer to this run'
+            self.get_logger().info(
+                f'Still waiting for the echo device ({waited:.0f}/'
+                f'{self.handshake_timeout_s:.0f}s, {stage})')
         self.publish_ping('h')
 
     def _on_pong(self, device, msg):
@@ -126,7 +148,9 @@ class HostTest(LinkTestNode):
             if self.peer is None:
                 self.peer = device
                 self._handshake_timer.cancel()
-                self.get_logger().info(f'Echo device "{device}" answered, starting test')
+                self.get_logger().info(
+                    f'Echo device "{device}" answered after '
+                    f'{time.monotonic() - self._t_handshake:.0f}s, starting test')
                 self.start()
             return
         try:
@@ -348,14 +372,49 @@ def format_summary(label, stats, unit=''):
             f'min={stats["min"]:.1f}{unit} max={stats["max"]:.1f}{unit}')
 
 
+def format_duration(seconds):
+    """Format a duration as ``42s`` or ``3m05s``."""
+    seconds = int(round(seconds))
+    if seconds < 60:
+        return f'{seconds}s'
+    return f'{seconds // 60}m{seconds % 60:02d}s'
+
+
+def parse_list(value, cast):
+    """
+    Parse a list parameter given as ``'16,64,200'``, a single number or a list.
+
+    Returns ``[]`` for an empty value.
+    """
+    if isinstance(value, (list, tuple)):
+        items = value
+    elif isinstance(value, str):
+        items = [item for item in value.replace(' ', '').strip('[]').split(',') if item]
+    else:
+        items = [value]
+    return [cast(item) for item in items]
+
+
+def _interrupt(signum, frame):
+    raise KeyboardInterrupt
+
+
 def run(node_cls, args=None):
-    """Spin ``node_cls`` until it sets ``done`` or is interrupted, then finish."""
-    rclpy.init(args=args)
+    """
+    Spin ``node_cls`` until it sets ``done`` or is interrupted, then finish.
+
+    rclpy's own signal handlers are off: they shut the context down at once,
+    so ``finish()`` could no longer log its results. Ctrl+C (SIGINT) and
+    SIGTERM (``timeout``, launch escalation) end the loop instead, and
+    ``finish()`` runs with ROS still up.
+    """
+    rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
+    signal.signal(signal.SIGTERM, _interrupt)
     node = node_cls()
     try:
         while rclpy.ok() and not node.done:
             rclpy.spin_once(node, timeout_sec=0.1)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         node.finish()

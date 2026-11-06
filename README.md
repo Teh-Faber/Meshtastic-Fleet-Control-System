@@ -174,17 +174,19 @@ Start the echo device on the remote (moving) device once, then run tests from th
 scripts/run_test.sh echo
 
 # Host
-scripts/run_test.sh latency    label:=500m
-scripts/run_test.sh throughput label:=500m payload_size:=200 interval_s:=2.0
-scripts/sweep_throughput.sh 30 label:=500m          # several sizes and intervals
+scripts/run_test.sh latency    label:=500m                         # ~30 s
+scripts/run_test.sh throughput label:=500m payload_size:=200       # ~30 s
+scripts/sweep_throughput.sh 20 label:=500m   # 12 size/interval combinations, ~3 min
 
 # Show results
 python3 scripts/analyze_results.py
 ```
 
-To measure range, move the remote device to each position and run the tests there with a new `label`. RSSI, SNR and hop count are recorded automatically. Results are written to `~/fleet_test_results/`.
+The durations are for `SHORT_FAST` and include the bridge start and the handshake (a few seconds). The tests log their progress as they go: each ping with its RTT and link quality, sending progress, and one result line per throughput run. The echo device logs which host tests it is answering, and a status line every 30 s while idle.
 
-Long test series run into the 10% duty cycle and then stop transmitting. Give `sweep_throughput.sh` a longer pause, e.g. `PAUSE_S=600 scripts/sweep_throughput.sh ...`.
+To measure range, move the remote device to each position and run the tests there with a new `label`. RSSI, SNR and hop count are recorded automatically, and so is the distance when both ends are T-Beams with a GPS fix. Results are written to `~/fleet_test_results/`.
+
+Long test series run into the 10% duty cycle and then stop transmitting. On `LONG_FAST`, sweep slower intervals and fewer sizes at a time, e.g. `SIZES=16,200 INTERVALS=4,2,1 scripts/sweep_throughput.sh`, and leave time between sweeps.
 
 ## Troubleshooting
 
