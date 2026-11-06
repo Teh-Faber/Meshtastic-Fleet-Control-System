@@ -39,6 +39,7 @@ import meshtastic.util
 from meshtastic_bridge import codec
 from pubsub import pub
 import rclpy
+from rclpy.exceptions import ParameterUninitializedException
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.qos import QoSProfile, ReliabilityPolicy
@@ -197,7 +198,13 @@ class BridgeNode(Node):
             f'rx {"on" if self.rx_enabled else "off"})')
 
     def param(self, name):
-        return self.get_parameter(name).value
+        """Return a parameter's value, or None for a typed parameter left unset."""
+        try:
+            return self.get_parameter(name).value
+        except ParameterUninitializedException:
+            # Humble raises for parameters declared with a type but no value,
+            # e.g. block_devices when the config leaves it out.
+            return None
 
     def parse_intervals(self, entries):
         """Parse ``topic_intervals`` entries of the form ``"<pattern>=<seconds>"``."""
