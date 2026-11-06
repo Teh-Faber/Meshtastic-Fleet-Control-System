@@ -2,8 +2,9 @@
 Launch the bridge and the throughput test on the host. The peer runs echo_device.launch.py.
 
 Run with:
-  ros2 launch meshtastic_bridge throughput_test.launch.py label:=500m payload_size:=200
-  ros2 launch meshtastic_bridge throughput_test.launch.py payload_sizes:=16,200 intervals:=1,0.5
+  ros2 launch meshtastic_bridge throughput_test.launch.py label:=500m      (ramp past the limit)
+  ros2 launch meshtastic_bridge throughput_test.launch.py interval_s:=0.5  (one run)
+  ros2 launch meshtastic_bridge throughput_test.launch.py payload_sizes:=16,210 intervals:=1,0.5
 """
 
 import os
@@ -20,11 +21,16 @@ SCRIPT = 'throughput_test.py'
 # Test parameters exposed as launch arguments: name -> default.
 TEST_ARGS = {
     'label': 'unlabeled',
-    'count': '20',
-    'interval_s': '1.0',
-    'payload_size': '200',
-    # Comma lists for a sweep over every combination, e.g. 16,64,200.
-    # '' runs payload_size every interval_s once.
+    # Each run lasts duration_s; count > 0 sends that many messages instead.
+    'duration_s': '10.0',
+    'count': '0',
+    # 0 ramps the rate up until past the link's limit; > 0 is one run at that interval.
+    'interval_s': '0.0',
+    # 210 B is the largest message that fits in one LoRa packet.
+    'payload_size': '210',
+    # Ramp: steps to keep going once goodput stops rising.
+    'overload_steps': '2',
+    # Comma lists for a sweep over every combination, e.g. 16,64,210.
     'payload_sizes': "''",
     'intervals': "''",
     'pause_s': '2.0',

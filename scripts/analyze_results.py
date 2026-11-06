@@ -73,9 +73,10 @@ def main():
         'latency_summary.csv': ['label', 'time', 'payload_size', 'sent', 'answered', 'pdr',
                                 'rtt_median_ms', 'rtt_p95_ms', 'rssi_mean', 'snr_mean', 'hops',
                                 'distance_m'],
-        'throughput_summary.csv': ['label', 'time', 'payload_size', 'interval_s', 'offered_Bps',
-                                   'sent', 'received', 'pdr', 'goodput_Bps', 'rssi_mean',
-                                   'snr_mean', 'hops', 'distance_m', 'status'],
+        'throughput_summary.csv': ['label', 'time', 'mode', 'payload_size', 'interval_s',
+                                   'offered_Bps', 'sent', 'received', 'pdr', 'goodput_Bps',
+                                   'delivered_msg_s', 'rssi_mean', 'snr_mean', 'hops',
+                                   'distance_m', 'status'],
     }
     for name, columns in tables.items():
         path = os.path.join(args.results_dir, name)

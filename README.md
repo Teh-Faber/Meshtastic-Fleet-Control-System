@@ -174,19 +174,19 @@ Start the echo device on the remote (moving) device once, then run tests from th
 scripts/run_test.sh echo
 
 # Host
-scripts/run_test.sh latency    label:=500m                         # ~30 s
-scripts/run_test.sh throughput label:=500m payload_size:=200       # ~30 s
-scripts/sweep_throughput.sh 20 label:=500m   # 12 size/interval combinations, ~3 min
+scripts/run_test.sh latency    label:=500m      # ~30 s
+scripts/run_test.sh throughput label:=500m      # ramps past the link's limit, ~1-1.5 min
+scripts/sweep_throughput.sh    label:=500m      # 3 sizes x 4 intervals, ~3 min
 
 # Show results
 python3 scripts/analyze_results.py
 ```
 
-The durations are for `SHORT_FAST` and include the bridge start and the handshake (a few seconds). The tests log their progress as they go: each ping with its RTT and link quality, sending progress, and one result line per throughput run. The echo device logs which host tests it is answering, and a status line every 30 s while idle.
+The durations are for `SHORT_FAST` and include the bridge start and the handshake (a few seconds). The throughput test raises the send rate step by step until the radio can't keep up, goes two steps past that, and reports the maximum goodput. `interval_s:=0.5` runs a single rate instead. The tests log their progress as they go: each ping with its RTT and link quality, sending progress, and one result line per throughput run. The echo device logs which host tests it is answering, and a status line every 30 s while idle.
 
 To measure range, move the remote device to each position and run the tests there with a new `label`. RSSI, SNR and hop count are recorded automatically, and so is the distance when both ends are T-Beams with a GPS fix. Results are written to `~/fleet_test_results/`.
 
-Long test series run into the 10% duty cycle and then stop transmitting. On `LONG_FAST`, sweep slower intervals and fewer sizes at a time, e.g. `SIZES=16,200 INTERVALS=4,2,1 scripts/sweep_throughput.sh`, and leave time between sweeps.
+Long test series run into the 10% duty cycle and then stop transmitting. Runs past the limit keep the radio transmitting for their whole duration, so on `SHORT_FAST` budget for about two sweeps or five throughput ramps per hour. On `LONG_FAST`, sweep slower intervals and fewer sizes at a time, e.g. `SIZES=16,210 INTERVALS=8,4,2,1 scripts/sweep_throughput.sh`, and leave time between sweeps.
 
 ## Troubleshooting
 
