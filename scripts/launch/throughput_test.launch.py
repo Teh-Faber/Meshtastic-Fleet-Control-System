@@ -2,7 +2,7 @@
 Launch the bridge and the throughput test on the host. The peer runs echo_device.launch.py.
 
 Run with:
-  ros2 launch meshtastic_bridge throughput_test.launch.py label:=500m      (ramp up to 600 B/s)
+  ros2 launch meshtastic_bridge throughput_test.launch.py label:=500m      (ramp up to 800 B/s)
   ros2 launch meshtastic_bridge throughput_test.launch.py max_rate_Bps:=400 ramp_steps:=8
   ros2 launch meshtastic_bridge throughput_test.launch.py interval_s:=0.5  (one run)
   ros2 launch meshtastic_bridge throughput_test.launch.py payload_sizes:=16,200 intervals:=1,0.5
@@ -28,7 +28,7 @@ TEST_ARGS = {
     # 0 ramps the rate up to max_rate_Bps; > 0 is one run at that interval.
     'interval_s': '0.0',
     # Ramp: top data rate (payload bytes/s), split into ramp_steps evenly spaced steps.
-    'max_rate_Bps': '600.0',
+    'max_rate_Bps': '800.0',
     'ramp_steps': '6',
     # Ramp: top radio packet rate, so small or fragmented messages don't flood the radio.
     'max_packet_rate': '4.0',
@@ -61,6 +61,8 @@ def generate_launch_description():
         # Bridge message size limits; empty keeps bridge_test.yaml (221 B, 4 packets).
         DeclareLaunchArgument('max_payload_bytes', default_value=''),
         DeclareLaunchArgument('max_fragments', default_value=''),
+        # true: the bridge sends with hop limit 0, so the other radio doesn't rebroadcast.
+        DeclareLaunchArgument('direct_only', default_value=''),
         *[DeclareLaunchArgument(name, default_value=value) for name, value in TEST_ARGS.items()],
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(os.path.join(share, 'launch', 'bridge.launch.py')),
@@ -70,6 +72,7 @@ def generate_launch_description():
                 'device_name': LaunchConfiguration('device_name'),
                 'max_payload_bytes': LaunchConfiguration('max_payload_bytes'),
                 'max_fragments': LaunchConfiguration('max_fragments'),
+                'direct_only': LaunchConfiguration('direct_only'),
             }.items(),
             condition=IfCondition(LaunchConfiguration('start_bridge')),
         ),

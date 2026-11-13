@@ -41,7 +41,7 @@ elif [ $# -ge 1 ] && [[ "$1" != *:=* ]]; then
 fi
 
 SIZES="${SIZES:-16,64,200}"
-MAX_RATE="${MAX_RATE:-600}"
+MAX_RATE="${MAX_RATE:-800}"
 STEPS="${STEPS:-6}"
 MAX_PACKET_RATE="${MAX_PACKET_RATE:-4}"
 # Seconds between runs, lets the radio's transmit queue drain.

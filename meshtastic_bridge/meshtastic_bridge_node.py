@@ -57,6 +57,16 @@ GPS_UERE_M = 5.0
 
 # Log radio refusals and notices at most this often.
 REFUSAL_LOG_PERIOD_S = 10.0
+# Announcements go out at least this far apart. Sent back to back, the last
+# of a burst was regularly lost (the receiving radio was busy, e.g.
+# rebroadcasting the previous packet), so a topic stayed unknown remotely.
+ANNOUNCE_SPACING_S = 0.3
+# Ask a device again for a topic it hasn't announced after this long.
+REQUEST_RETRY_S = 5.0
+# Answer requests for one topic at most this often (several devices may ask).
+ANSWER_REQUEST_S = 2.0
+# Answer requests for all topics (from bridges without topic ids) at most this often.
+ANSWER_REQUEST_ALL_S = 10.0
 # Why the radio refused to send one of our packets (routing error reasons).
 REFUSAL_HINTS = {
     'DUTY_CYCLE_LIMIT': 'the hourly duty-cycle airtime budget (10 % in EU_868) is used up; '
@@ -193,6 +203,7 @@ class BridgeNode(Node):
         self.declare_parameter('dest', '^all')
         self.declare_parameter('channel_index', 0)
         self.declare_parameter('hop_limit', 0)
+        self.declare_parameter('direct_only', False)
         self.declare_parameter('port_num', 'PRIVATE_APP')
         self.declare_parameter('max_payload_bytes', codec.MAX_PAYLOAD_BYTES)
         self.declare_parameter('poll_hz', 20.0)
@@ -221,6 +232,8 @@ class BridgeNode(Node):
         self.dest = self.param('dest')
         self.channel_index = self.param('channel_index')
         self.hop_limit = self.param('hop_limit')
+        # Send with hop limit 0: nobody relays (rebroadcasts) our packets.
+        self.direct_only = self.param('direct_only')
         self.port_name = self.param('port_num')
         self.port_num = portnums_pb2.PortNum.Value(self.port_name)
         self.max_payload_bytes = self.param('max_payload_bytes')
@@ -230,8 +243,11 @@ class BridgeNode(Node):
         self.device_names = {}    # sender id -> device name
         self.own_topics = set()   # topics this node publishes; never sent back out
         self.unsupported = set()  # local topics whose type could not be loaded
-        self.last_request = {}    # sender id -> time we last asked it to announce
+        self.last_request = {}    # (sender id, topic id) -> time we last asked for it
         self.last_announce_all = 0.0
+        self.announce_queue = {}  # local topic name -> TxTopic, sent ANNOUNCE_SPACING_S apart
+        self.last_announce_sent = 0.0
+        self.last_answer = {}     # topic id -> time we last answered a request for it
         self.reassembler = codec.Reassembler()
 
         # Best effort matches both reliable and best-effort publishers. Depth 1
@@ -459,7 +475,7 @@ class BridgeNode(Node):
                 destinationId=dest or self.dest,
                 portNum=self.port_num,
                 channelIndex=self.channel_index,
-                hopLimit=self.hop_limit or None,
+                hopLimit=0 if self.direct_only else (self.hop_limit or None),
             )
         except Exception as e:
             self.get_logger().error(f'sendData failed: {e}', throttle_duration_sec=5.0)
@@ -542,13 +558,41 @@ class BridgeNode(Node):
             self.send(packet)
 
     def announce(self, topic):
-        self.send(codec.encode_announce(
-            topic.topic_id, self.device_name, topic.name, topic.msg_type))
+        """Queue an announcement; send_announcements() spaces them out."""
+        self.announce_queue[topic.name] = topic
 
     def announce_all(self):
         self.last_announce_all = time.monotonic()
         for topic in self.tx_topics.values():
             self.announce(topic)
+
+    def send_announcements(self):
+        now = time.monotonic()
+        if not self.announce_queue or now - self.last_announce_sent < ANNOUNCE_SPACING_S:
+            return
+        name = next(iter(self.announce_queue))
+        topic = self.announce_queue.pop(name)
+        self.last_announce_sent = now
+        self.send(codec.encode_announce(
+            topic.topic_id, self.device_name, topic.name, topic.msg_type))
+
+    def answer_request(self, fields):
+        """Re-announce the topic a device asked for, or all topics if it didn't say."""
+        if not self.tx_enabled:
+            return
+        now = time.monotonic()
+        tid = fields.get('topic_id')
+        if tid is None:
+            # A bridge without topic ids in requests; several may ask at once.
+            if now - self.last_announce_all > ANSWER_REQUEST_ALL_S:
+                self.announce_all()
+            return
+        if now - self.last_answer.get(tid, 0.0) < ANSWER_REQUEST_S:
+            return
+        for topic in self.tx_topics.values():
+            if topic.topic_id == tid:
+                self.last_answer[tid] = now
+                self.announce(topic)
 
     # --- GPS: the radio's own position -------------------------------------
 
@@ -600,6 +644,7 @@ class BridgeNode(Node):
                 self.interface = None
                 # TODO: schedule reconnect.
         self.log_refusals()
+        self.send_announcements()
         for topic in self.tx_topics.values():
             self.send_if_due(topic)
         self.reassembler.expire()
@@ -632,9 +677,7 @@ class BridgeNode(Node):
             return
 
         if kind == codec.KIND_REQUEST:
-            # Several devices may ask at once; answer at most every 10 s.
-            if self.tx_enabled and time.monotonic() - self.last_announce_all > 10.0:
-                self.announce_all()
+            self.answer_request(fields)
         elif not self.rx_enabled:
             return
         elif kind == codec.KIND_ANNOUNCE:
@@ -694,7 +737,7 @@ class BridgeNode(Node):
     def handle_data(self, sender, fields, packet):
         remote = self.remote_topics.get((sender, fields['topic_id']))
         if remote is None:
-            self.request_announce(sender)
+            self.request_announce(sender, fields['topic_id'])
             return
         serialized = self.reassembler.add(sender, fields)
         if serialized is None or remote.publisher is None:
@@ -707,11 +750,14 @@ class BridgeNode(Node):
         self.publish_link_quality(sender, remote, fields['msg_seq'], packet)
         remote.publisher.publish(msg)
 
-    def request_announce(self, sender):
+    def request_announce(self, sender, tid):
+        """Ask ``sender`` to announce topic ``tid``, whose data arrived unannounced."""
         now = time.monotonic()
-        if now - self.last_request.get(sender, 0.0) > 30.0:
-            self.last_request[sender] = now
-            self.send(codec.encode_request(), dest=sender)
+        if now - self.last_request.get((sender, tid), 0.0) >= REQUEST_RETRY_S:
+            self.last_request[(sender, tid)] = now
+            self.get_logger().info(
+                f'Data for unknown topic {tid:#06x} from {sender}, asking it to announce')
+            self.send(codec.encode_request(tid), dest=sender)
 
     def publish_link_quality(self, sender, remote, msg_seq, packet):
         # protobuf omits zero-valued fields, so hopStart may be missing.

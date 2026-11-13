@@ -43,6 +43,8 @@ def generate_launch_description():
         # Bridge message size limits; empty keeps bridge_test.yaml (221 B, 4 packets).
         DeclareLaunchArgument('max_payload_bytes', default_value=''),
         DeclareLaunchArgument('max_fragments', default_value=''),
+        # true: the bridge sends with hop limit 0, so the other radio doesn't rebroadcast.
+        DeclareLaunchArgument('direct_only', default_value=''),
         *[DeclareLaunchArgument(name, default_value=value) for name, value in TEST_ARGS.items()],
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(os.path.join(share, 'launch', 'bridge.launch.py')),
@@ -52,6 +54,7 @@ def generate_launch_description():
                 'device_name': LaunchConfiguration('device_name'),
                 'max_payload_bytes': LaunchConfiguration('max_payload_bytes'),
                 'max_fragments': LaunchConfiguration('max_fragments'),
+                'direct_only': LaunchConfiguration('direct_only'),
             }.items(),
             condition=IfCondition(LaunchConfiguration('start_bridge')),
         ),

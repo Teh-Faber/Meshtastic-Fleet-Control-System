@@ -11,11 +11,12 @@ comes back).
 Modes:
 
 - **Ramp** (default, ``interval_s:=0``): offers ``ramp_steps`` evenly
-  spaced data rates up to ``max_rate_Bps``. With the defaults (600 B/s, 6
-  steps) that is 100, 200, ... 600 B/s, i.e. 200 B messages every 2 s down
-  to every 0.33 s. ``max_packet_rate`` caps the top step in radio packets
-  per second (default 4), whatever the B/s, so neither small messages nor
-  messages split into several packets flood the radio. Once goodput stops
+  spaced data rates up to ``max_rate_Bps``. With the defaults (800 B/s, 6
+  steps) that is 133, 267, ... 800 B/s, i.e. 200 B messages every 1.5 s down
+  to every 0.25 s; a T-Beam pair on SHORT_FAST carries ~550-580 B/s.
+  ``max_packet_rate`` caps the top step in radio packets per second
+  (default 4), whatever the B/s, so neither small messages nor messages
+  split into several packets flood the radio. Once goodput stops
   rising it does ``overload_steps`` more steps to show the overload, then
   stops (``overload_steps:=0`` runs every step), and logs the maximum
   goodput. With ``payload_sizes`` it ramps each size.
@@ -80,6 +81,10 @@ MIN_COUNT = 5
 # Wait this long after the last message before the first report request.
 REPORT_DELAY_S = 1.0
 REPORT_RETRY_S = 2.0
+# After the first report, ask once more this long later and keep the higher
+# count: the last messages of a run may still have been in flight.
+REPORT_CONFIRM_S = 2.0
+REPORT_CONFIRM_TIMEOUT_S = 6.0
 # Log sending progress at most this often.
 PROGRESS_PERIOD_S = 5.0
 
@@ -97,7 +102,7 @@ class ThroughputTest(HostTest):
         self.intervals = parse_list(self.param('intervals', ''), float)
         self.interval_s = self.param('interval_s', 0.0)
         # Ramp: top data rate (payload bytes/s) and number of evenly spaced steps.
-        self.max_rate_Bps = self.param('max_rate_Bps', 600.0)
+        self.max_rate_Bps = self.param('max_rate_Bps', 800.0)
         self.ramp_steps = max(1, self.param('ramp_steps', 6))
         # Ramp: top radio packet rate, whatever max_rate_Bps allows.
         self.max_packet_rate = self.param('max_packet_rate', 4.0)
@@ -137,6 +142,9 @@ class ThroughputTest(HostTest):
         self.seq = 0
         self.count = 0
         self.report = None
+        self.t_first_report = 0.0
+        self.confirm_sent = False
+        self.confirmed = False
         self.t_start = None
         self.t_last_progress = 0.0
         self.t_next_request = 0.0
@@ -225,6 +233,18 @@ class ThroughputTest(HostTest):
         return [size / (top_Bps * step / self.ramp_steps)
                 for step in range(1, self.ramp_steps + 1)]
 
+    def raise_hint(self, size):
+        """Which cap ended the ramp for ``size``, and what to raise it to."""
+        packet_cap_Bps = self.max_packet_rate * size / self.packets[size]
+        packet_hint = f'max_packet_rate (e.g. to {self.max_packet_rate * 1.5:g})'
+        rate_hint = f'max_rate_Bps (e.g. to {self.max_rate_Bps * 1.5:.0f})'
+        if math.isclose(packet_cap_Bps, self.max_rate_Bps):
+            return f'Raise both {packet_hint} and {rate_hint}'
+        if packet_cap_Bps < self.max_rate_Bps:
+            return (f'Raise {packet_hint}; the top step was capped at '
+                    f'{self.max_packet_rate:g} packets/s')
+        return f'Raise {rate_hint}'
+
     def run_count(self, interval):
         if self.fixed_count > 0:
             return self.fixed_count
@@ -277,6 +297,7 @@ class ThroughputTest(HostTest):
         self.count = self.run_count(interval)
         self.seq = 0
         self.report = None
+        self.confirm_sent = self.confirmed = False
         self.set_state('send')
         self.t_last_progress = time.monotonic()
         self.get_logger().info(
@@ -314,7 +335,11 @@ class ThroughputTest(HostTest):
         now = time.monotonic()
         if self.state == 'report':
             if self.report is not None:
-                self.finish_run('ok')
+                if self.confirmed or now - self.t_first_report > REPORT_CONFIRM_TIMEOUT_S:
+                    self.finish_run('ok')
+                elif not self.confirm_sent and now - self.t_first_report >= REPORT_CONFIRM_S:
+                    self.request_pub.publish(String(data=str(self.run_id_now)))
+                    self.confirm_sent = True
             elif now - self.state_since > self.report_timeout_s:
                 self.get_logger().error(
                     f'{self.run_label()}: no report from the echo device within '
@@ -331,8 +356,19 @@ class ThroughputTest(HostTest):
             report = json.loads(msg.data)
         except ValueError:
             return
-        if self.state == 'report' and report.get('run_id') == self.run_id_now:
+        if self.state != 'report' or report.get('run_id') != self.run_id_now:
+            return
+        if self.report is None:
             self.report = report
+            self.t_first_report = time.monotonic()
+        elif self.confirm_sent:
+            # Counts only grow, so the higher one is the more complete report.
+            if report.get('received', 0) > self.report.get('received', 0):
+                self.get_logger().info(
+                    f'{self.run_label()}: {report["received"] - self.report["received"]} more '
+                    'message(s) arrived after the first report (still in flight)')
+                self.report = report
+            self.confirmed = True
 
     # --- results -----------------------------------------------------------
 
@@ -359,7 +395,7 @@ class ThroughputTest(HostTest):
         """Track the best goodput per size; stop a size's ramp once past the limit."""
         size = row['payload_size']
         ramp = self.ramp.setdefault(
-            size, {'best': None, 'beyond': 0, 'done': False, 'failed': False})
+            size, {'best': None, 'beyond': 0, 'done': False, 'failed': False, 'dropped': False})
         best = ramp['best']
         if not row['received'] and best is None:
             # Nothing has arrived at this size yet, at the slowest rate so far.
@@ -376,6 +412,9 @@ class ThroughputTest(HostTest):
             return
         if goodput > best_goodput:
             ramp['best'] = row  # slightly higher, but no longer rising
+        elif goodput < best_goodput / RAMP_GAIN:
+            # Offering more delivered clearly less: the link is past its limit.
+            ramp['dropped'] = True
         ramp['beyond'] += 1
         if ramp['beyond'] == 1:
             self.get_logger().info(
@@ -445,13 +484,21 @@ class ThroughputTest(HostTest):
                 continue
             if best is None:
                 continue
-            if ramp['beyond']:
+            confirmed = (self.overload_steps == 0 or ramp['dropped']
+                         or ramp['beyond'] >= self.overload_steps)
+            if ramp['beyond'] and confirmed:
                 log.info(f'Max goodput ({size} B messages): {best["goodput_Bps"]} B/s '
                          f'= {best["delivered_msg_s"]} msg/s, reached at {best["interval_s"]}s '
                          'intervals; faster sending only loses more messages')
+            elif ramp['beyond']:
+                log.info(f'Goodput ({size} B messages) levelled off at the top of the ramp: '
+                         f'{best["goodput_Bps"]} B/s = {best["delivered_msg_s"]} msg/s, but only '
+                         f'{ramp["beyond"]} of {self.overload_steps} steps past it fit in the '
+                         f'ramp. {self.raise_hint(size)} to confirm the limit')
             else:
                 log.info(f'Goodput ({size} B messages) still rising at the fastest step: '
-                         f'{best["goodput_Bps"]} B/s. The limit is above what the ramp offers')
+                         f'{best["goodput_Bps"]} B/s. The limit is above what the ramp offers; '
+                         f'{self.raise_hint(size)[0].lower()}{self.raise_hint(size)[1:]}')
         if self.summary_path:
             log.info(f'Summary in {self.summary_path}')
 

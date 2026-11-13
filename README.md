@@ -175,7 +175,7 @@ scripts/run_test.sh echo
 
 # Host
 scripts/run_test.sh latency    label:=500m      # ~30 s
-scripts/run_test.sh throughput label:=500m                   # ramp up to 600 B/s, ~1-1.5 min
+scripts/run_test.sh throughput label:=500m                   # ramp up to 800 B/s, ~1.5-2 min
 scripts/run_test.sh throughput label:=500m max_rate_Bps:=400  # ramp up to 400 B/s
 scripts/run_test.sh throughput label:=500m payload_size:=800  # 800 B messages (4 packets each)
 scripts/sweep_throughput.sh    label:=500m                   # 3 sizes x 6 steps, ~4 min
@@ -184,7 +184,7 @@ scripts/sweep_throughput.sh    label:=500m                   # 3 sizes x 6 steps
 python3 scripts/analyze_results.py
 ```
 
-The durations are for `SHORT_FAST` and include the bridge start and the handshake (a few seconds). The throughput test raises the offered data rate in `ramp_steps` (default 6) even steps up to `max_rate_Bps` (default 600 B/s), at most `max_packet_rate` (default 4) radio packets per second. `payload_size` (default 200 B) sets the message size: up to 200 B fits one radio packet, and up to 848 B is split into 4 (`max_fragments:=8` allows 1712 B). Sizes that won't fit are refused with the reason. It stops two steps after goodput stops rising and reports the maximum goodput. Set `max_rate_Bps` a little above the rate you expect the link to carry: offering far more doesn't measure anything extra, it only overwhelms the radio. `interval_s:=0.5` runs a single rate instead. The tests log their progress as they go: each ping with its RTT and link quality, sending progress, and one result line per throughput run. The echo device logs which host tests it is answering, and a status line every 30 s while idle.
+The durations are for `SHORT_FAST` and include the bridge start and the handshake (a few seconds). The throughput test raises the offered data rate in `ramp_steps` (default 6) even steps up to `max_rate_Bps` (default 800 B/s), at most `max_packet_rate` (default 4) radio packets per second. `payload_size` (default 200 B) sets the message size: up to 200 B fits one radio packet, and up to 848 B is split into 4 (`max_fragments:=8` allows 1712 B). Sizes that won't fit are refused with the reason. It stops two steps after goodput stops rising and reports the maximum goodput. Set `max_rate_Bps` a little above the rate you expect the link to carry: offering far more doesn't measure anything extra, it only overwhelms the radio. `interval_s:=0.5` runs a single rate instead. The tests log their progress as they go: each ping with its RTT and link quality, sending progress, and one result line per throughput run. The echo device logs which host tests it is answering, and a status line every 30 s while idle.
 
 To measure range, move the remote device to each position and run the tests there with a new `label`. RSSI, SNR and hop count are recorded automatically, and so is the distance when both ends are T-Beams with a GPS fix. Results are written to `results/` in the workspace (`~/fleet_ws/results/`), or to `output_dir:=...` / `$FLEET_RESULTS_DIR` if set.
 

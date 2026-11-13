@@ -79,6 +79,10 @@ meshtastic_bridge_node:
     channel_index: 0
     # 0 uses the firmware default (lora.hop_limit, normally 3).
     hop_limit: 0
+    # true: send with hop limit 0, so no other radio relays (rebroadcasts) our
+    # packets. For a direct link between two radios this saves the airtime of
+    # every rebroadcast, during which the receiver can't hear the next packet.
+    direct_only: false
     port_num: PRIVATE_APP
     # Bridge bytes per LoRa packet. 233 (Meshtastic's DATA_PAYLOAD_LEN) is
     # rejected by the firmware as TOO_LARGE on PRIVATE_APP; 221 is the largest

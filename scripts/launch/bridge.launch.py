@@ -17,8 +17,9 @@ from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
-# Size limits that override the config only when set (name -> type).
-OPTIONAL_OVERRIDES = {'max_payload_bytes': int, 'max_fragments': int}
+# Settings that override the config only when given (name -> conversion).
+OPTIONAL_OVERRIDES = {'max_payload_bytes': int, 'max_fragments': int,
+                      'direct_only': lambda v: v.lower() == 'true'}
 
 
 def bridge_node(context):
@@ -62,5 +63,8 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'max_fragments', default_value='',
             description='Most packets per message. Empty: from the config (4)'),
+        DeclareLaunchArgument(
+            'direct_only', default_value='',
+            description='true: send with hop limit 0, nobody relays. Empty: from the config'),
         OpaqueFunction(function=bridge_node),
     ])
