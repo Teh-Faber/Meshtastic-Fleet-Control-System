@@ -2,7 +2,8 @@
 Launch the bridge and the throughput test on the host. The peer runs echo_device.launch.py.
 
 Run with:
-  ros2 launch meshtastic_bridge throughput_test.launch.py label:=500m      (ramp past the limit)
+  ros2 launch meshtastic_bridge throughput_test.launch.py label:=500m      (ramp up to 600 B/s)
+  ros2 launch meshtastic_bridge throughput_test.launch.py max_rate_Bps:=400 ramp_steps:=8
   ros2 launch meshtastic_bridge throughput_test.launch.py interval_s:=0.5  (one run)
   ros2 launch meshtastic_bridge throughput_test.launch.py payload_sizes:=16,200 intervals:=1,0.5
 """
@@ -24,11 +25,16 @@ TEST_ARGS = {
     # Each run lasts duration_s; count > 0 sends that many messages instead.
     'duration_s': '10.0',
     'count': '0',
-    # 0 ramps the rate up until past the link's limit; > 0 is one run at that interval.
+    # 0 ramps the rate up to max_rate_Bps; > 0 is one run at that interval.
     'interval_s': '0.0',
+    # Ramp: top data rate (payload bytes/s), split into ramp_steps evenly spaced steps.
+    'max_rate_Bps': '600.0',
+    'ramp_steps': '6',
+    # Ramp: top message rate, so small messages don't flood the radio.
+    'max_msg_rate': '4.0',
     # 200 B is the largest test message that fits in one bridge packet (221 B).
     'payload_size': '200',
-    # Ramp: steps to keep going once goodput stops rising.
+    # Ramp: steps to keep going once goodput stops rising (0 = run every step).
     'overload_steps': '2',
     # Comma lists for a sweep over every combination, e.g. 16,64,200.
     'payload_sizes': "''",
@@ -36,7 +42,8 @@ TEST_ARGS = {
     'pause_s': '2.0',
     'report_timeout_s': '30.0',
     'handshake_timeout_s': '60.0',
-    'output_dir': '~/fleet_test_results',
+    # '' writes to <workspace>/results (or $FLEET_RESULTS_DIR).
+    'output_dir': "''",
 }
 
 

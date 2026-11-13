@@ -10,11 +10,14 @@ comes back).
 
 Modes:
 
-- **Ramp** (default, ``interval_s:=0``): starts slow and shortens the
-  interval step by step (``RAMP_INTERVALS``) until the offered load is well
-  past what the radio can carry. Once goodput stops rising it does
-  ``overload_steps`` more steps to show the overload, then stops, and logs
-  the maximum goodput.
+- **Ramp** (default, ``interval_s:=0``): offers ``ramp_steps`` evenly
+  spaced data rates up to ``max_rate_Bps``. With the defaults (600 B/s, 6
+  steps) that is 100, 200, ... 600 B/s, i.e. 200 B messages every 2 s down
+  to every 0.33 s. ``max_msg_rate`` caps the top step in messages per
+  second (default 4), so small messages don't flood the radio at the same
+  B/s. Once goodput stops rising it does ``overload_steps`` more steps to
+  show the overload, then stops (``overload_steps:=0`` runs every step), and
+  logs the maximum goodput. With ``payload_sizes`` it ramps each size.
 - **Single run**: ``interval_s:=0.5`` sends one run at that interval.
 - **Sweep**: ``payload_sizes`` and ``intervals`` (comma separated, e.g.
   ``16,64,200``) run every combination, without stopping early.
@@ -52,16 +55,16 @@ from link_test_common import (append_summary, DATA, DATA_HEADER, format_duration
                               parse_list, REPORT, REPORT_REQUEST, run, TopicWatcher)
 from std_msgs.msg import String, UInt8MultiArray
 
-# Ramp steps (s between messages). The T-Beam sends a few packets per second
-# at most on SHORT_FAST (its queue drains slowly and the Meshtastic Python
-# library sleeps 0.1 s per write), so it saturates around 0.3 s and 0.05 s
-# offers several times its capacity. On LONG_FAST (~2 s on air per 200 B
-# message) it saturates at the first step.
-RAMP_INTERVALS = [1.0, 0.5, 0.3, 0.2, 0.15, 0.1, 0.05]
+# The T-Beam sends at most a few packets per second on SHORT_FAST: its
+# 16-packet queue drains slowly, and the Meshtastic Python library sleeps
+# 0.1 s after every write, so it can't hand over more than ~10 messages/s.
+# Offering far more than the radio drains only overwhelms it, so the ramp
+# tops out at max_rate_Bps (bytes/s) and max_msg_rate (messages/s).
+LIBRARY_MAX_MSG_RATE = 10.0
 # Goodput must rise by more than this to count as "still rising".
 RAMP_GAIN = 1.05
 # Fewest messages per run, whatever duration_s says.
-MIN_COUNT = 10
+MIN_COUNT = 5
 # Wait this long after the last message before the first report request.
 REPORT_DELAY_S = 1.0
 REPORT_RETRY_S = 2.0
@@ -78,22 +81,29 @@ class ThroughputTest(HostTest):
         self.duration_s = self.param('duration_s', 10.0)
         sizes = parse_list(self.param('payload_sizes', ''), int) or \
             [self.param('payload_size', 200)]
+        sizes = [max(DATA_HEADER.size, size) for size in sizes]
         intervals = parse_list(self.param('intervals', ''), float)
         interval_s = self.param('interval_s', 0.0)
+        # Ramp: top data rate (payload bytes/s) and number of evenly spaced steps.
+        self.max_rate_Bps = self.param('max_rate_Bps', 600.0)
+        self.ramp_steps = max(1, self.param('ramp_steps', 6))
+        # Ramp: top message rate, whatever max_rate_Bps allows for small messages.
+        self.max_msg_rate = self.param('max_msg_rate', 4.0)
         if intervals:
             self.mode = 'sweep'
+            self.runs = [(size, interval) for size in sizes for interval in intervals]
         elif interval_s > 0:
             self.mode = 'single'
-            intervals = [interval_s]
+            self.runs = [(size, interval_s) for size in sizes]
         else:
             self.mode = 'ramp'
-            intervals = RAMP_INTERVALS
+            self.runs = [(size, interval) for size in sizes
+                         for interval in self.ramp_intervals(size)]
+        # 0: never stop a ramp early.
         self.overload_steps = self.param('overload_steps', 2)
         self.report_timeout_s = self.param('report_timeout_s', 30.0)
         # Lets the radio's transmit queue drain between runs.
         self.pause_s = self.param('pause_s', 2.0)
-        self.runs = [(max(DATA_HEADER.size, size), interval)
-                     for size in sizes for interval in intervals]
 
         # Created before the handshake so the bridge has already announced
         # these topics when the measured part starts.
@@ -122,6 +132,12 @@ class ThroughputTest(HostTest):
         # Every run gets its own id; the echo device keeps counts per id.
         return (self.run_id + 1 + self.index) & 0xFFFF
 
+    def ramp_intervals(self, size):
+        """Intervals of the ramp for ``size``-byte messages, slowest first."""
+        top_Bps = min(self.max_rate_Bps, self.max_msg_rate * size)
+        return [size / (top_Bps * step / self.ramp_steps)
+                for step in range(1, self.ramp_steps + 1)]
+
     def run_count(self, interval):
         if self.fixed_count > 0:
             return self.fixed_count
@@ -131,11 +147,24 @@ class ThroughputTest(HostTest):
         self.t_start = time.monotonic()
         send_s = sum(self.run_count(interval) * interval for _, interval in self.runs)
         overhead_s = len(self.runs) * (REPORT_DELAY_S + 1.0 + self.pause_s)
-        what = {'ramp': 'ramp to past the limit, stops early once saturated',
-                'single': 'single run', 'sweep': 'sweep'}[self.mode]
-        self.get_logger().info(
-            f'Throughput ({what}): up to {len(self.runs)} run(s), '
-            f'at most {format_duration(send_s + overhead_s)}')
+        log = self.get_logger()
+        if self.mode == 'ramp':
+            tops = []
+            for size in dict.fromkeys(size for size, _ in self.runs):
+                fastest = min(interval for s, interval in self.runs if s == size)
+                tops.append(f'{size} B up to {size / fastest:.0f} B/s')
+            stop = ('runs every step' if self.overload_steps == 0
+                    else f'stops {self.overload_steps} steps after saturating')
+            what = f'ramp in {self.ramp_steps} steps, {", ".join(tops)}, {stop}'
+        else:
+            what = {'single': 'single run', 'sweep': 'sweep'}[self.mode]
+        log.info(f'Throughput ({what}): up to {len(self.runs)} run(s), '
+                 f'at most {format_duration(send_s + overhead_s)}')
+        top_msg_rate = max(1.0 / interval for _, interval in self.runs)
+        if top_msg_rate > LIBRARY_MAX_MSG_RATE:
+            log.warn(f'Top step is {top_msg_rate:.1f} messages/s; the Meshtastic Python library '
+                     f'hands at most ~{LIBRARY_MAX_MSG_RATE:.0f}/s to the radio, the rest is '
+                     'overwritten in the bridge')
         self.create_timer(0.1, self.control)
         self.next_run()
 
@@ -155,8 +184,9 @@ class ThroughputTest(HostTest):
         self.set_state('send')
         self.t_last_progress = time.monotonic()
         self.get_logger().info(
-            f'{self.run_label()}: {self.count} x {size} B every {interval}s '
-            f'(offered {size / interval:.0f} B/s, ~{format_duration(self.count * interval)})')
+            f'{self.run_label()}: offering {size / interval:.0f} B/s = {self.count} x {size} B '
+            f'every {interval:.2f}s ({1 / interval:.1f} msg/s, '
+            f'~{format_duration(self.count * interval)})')
         self.send_timer = self.create_timer(interval, self.send_one)
 
     def set_state(self, state):
@@ -254,7 +284,7 @@ class ThroughputTest(HostTest):
             self.get_logger().info(
                 f'Goodput stopped rising: link saturated at about '
                 f'{ramp["best"]["goodput_Bps"]} B/s')
-        if ramp['beyond'] >= self.overload_steps:
+        if self.overload_steps and ramp['beyond'] >= self.overload_steps:
             ramp['done'] = True
             self.get_logger().info(
                 f'{self.overload_steps} step(s) past the limit, ending the ramp')
@@ -275,7 +305,7 @@ class ThroughputTest(HostTest):
             'peer': self.peer,
             'mode': self.mode,
             'payload_size': size,
-            'interval_s': interval,
+            'interval_s': round(interval, 3),
             'offered_Bps': round(size / interval, 1),
             'sent': self.seq,
             'received': received,

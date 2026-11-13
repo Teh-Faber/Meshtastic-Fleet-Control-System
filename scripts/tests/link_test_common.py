@@ -63,7 +63,9 @@ class LinkTestNode(Node):
     def __init__(self, name):
         super().__init__(name)
         self.done = False
-        self.output_dir = os.path.expanduser(self.param('output_dir', '~/fleet_test_results'))
+        # '' (default): <workspace>/results, see default_results_dir().
+        self.output_dir = os.path.expanduser(
+            self.param('output_dir', '') or default_results_dir())
         # Fixes older than this are treated as no fix.
         self.max_fix_age_s = self.param('max_fix_age_s', 300.0)
         self.gps = GpsFix(self, self.param('gps_topic', GPS_TOPIC))
@@ -275,6 +277,28 @@ class TopicWatcher:
             self.subs[name] = self.node.create_subscription(
                 self.msg_type, name, lambda msg, d=device: self.callback(d, msg), 10)
             self.node.get_logger().info(f'Watching {name}')
+
+
+def default_results_dir():
+    """
+    Return where results go unless ``output_dir`` is set.
+
+    That is ``$FLEET_RESULTS_DIR``, else ``<workspace>/results``, else
+    ``~/fleet_test_results``. The workspace is the first directory above this file that holds both
+    ``src`` and ``install``, so it is found whether the tests run from the
+    source tree or from the colcon install.
+    """
+    if os.environ.get('FLEET_RESULTS_DIR'):
+        return os.environ['FLEET_RESULTS_DIR']
+    path = os.path.dirname(os.path.abspath(__file__))
+    while True:
+        if os.path.isdir(os.path.join(path, 'src')) and \
+                os.path.isdir(os.path.join(path, 'install')):
+            return os.path.join(path, 'results')
+        parent = os.path.dirname(path)
+        if parent == path:
+            return os.path.expanduser('~/fleet_test_results')
+        path = parent
 
 
 class CsvLog:

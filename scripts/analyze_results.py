@@ -2,7 +2,7 @@
 """
 Summarize the link test results.
 
-Usage: python3 scripts/analyze_results.py [results dir, default ~/fleet_test_results]
+Usage: python3 scripts/analyze_results.py [results dir, default <workspace>/results]
 
 Prints latency_summary.csv and throughput_summary.csv as tables (one row
 per run, grouped by label), followed by per-ping RTT, link and GPS distance
@@ -63,10 +63,24 @@ def summarize_run(rows):
     return line
 
 
+def default_results_dir():
+    """Return the tests' results dir: $FLEET_RESULTS_DIR, else <workspace>/results."""
+    if os.environ.get('FLEET_RESULTS_DIR'):
+        return os.environ['FLEET_RESULTS_DIR']
+    path = os.path.dirname(os.path.abspath(__file__))
+    while True:
+        if os.path.isdir(os.path.join(path, 'src')) and \
+                os.path.isdir(os.path.join(path, 'install')):
+            return os.path.join(path, 'results')
+        parent = os.path.dirname(path)
+        if parent == path:
+            return os.path.expanduser('~/fleet_test_results')
+        path = parent
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
-    parser.add_argument('results_dir', nargs='?',
-                        default=os.path.expanduser('~/fleet_test_results'))
+    parser.add_argument('results_dir', nargs='?', default=default_results_dir())
     args = parser.parse_args()
 
     tables = {

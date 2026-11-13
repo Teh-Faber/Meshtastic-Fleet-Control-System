@@ -25,7 +25,8 @@ TEST_ARGS = {
     'timeout_s': '10.0',
     'payload_size': '0',
     'handshake_timeout_s': '60.0',
-    'output_dir': '~/fleet_test_results',
+    # '' writes to <workspace>/results (or $FLEET_RESULTS_DIR).
+    'output_dir': "''",
 }
 
 

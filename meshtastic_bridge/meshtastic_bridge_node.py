@@ -29,6 +29,7 @@ TODO: reconnect after the serial link drops, unsubscribe from topics
 that disappear, optional ACKs for selected topics.
 """
 
+import collections
 import fnmatch
 import queue
 import re
@@ -53,6 +54,19 @@ from sensor_msgs.msg import NavSatFix, NavSatStatus
 
 # Assumed GPS user range error (m), used to turn PDOP into a covariance.
 GPS_UERE_M = 5.0
+
+# Log radio refusals and notices at most this often.
+REFUSAL_LOG_PERIOD_S = 10.0
+# Why the radio refused to send one of our packets (routing error reasons).
+REFUSAL_HINTS = {
+    'DUTY_CYCLE_LIMIT': 'the hourly duty-cycle airtime budget (10 % in EU_868) is used up; '
+                        'the radio sends nothing until it recovers',
+    'RATE_LIMIT_EXCEEDED': 'the firmware is rate limiting packets from this client; '
+                           'send less often',
+    'TOO_LARGE': 'packet too large for the radio; lower max_payload_bytes',
+    'NO_CHANNEL': 'channel_index is not set up on the radio',
+    'NO_INTERFACE': 'the radio has no usable LoRa interface (region unset?)',
+}
 
 
 def sanitize_name(name):
@@ -231,8 +245,12 @@ class BridgeNode(Node):
         self.my_node_num = None
         self.gps_pub = None
         self.last_fix_key = None
+        self.refusals = collections.Counter()  # routing error -> packets since last log
+        self.last_refusal_log = 0.0
+        self.last_notices = {}  # notice text -> time last logged
         pub.subscribe(self._on_receive, 'meshtastic.receive')
         pub.subscribe(self._on_connection_lost, 'meshtastic.connection.lost')
+        pub.subscribe(self._on_client_notification, 'meshtastic.clientNotification')
         self.connect()
         self.device_name = self.resolve_device_name(self.param('device_name'))
 
@@ -454,6 +472,15 @@ class BridgeNode(Node):
               and packet.get('from') == self.my_node_num):
             # Our own position, sent by the firmware to the API client.
             self._inbox.put(('pos', packet['decoded'].get('position', {})))
+        elif portnum == 'ROUTING_APP':
+            # The firmware NAKs a packet it won't send (duty cycle, too large...).
+            reason = packet['decoded'].get('routing', {}).get('errorReason')
+            if reason and reason != 'NONE' and packet['decoded'].get('requestId'):
+                self._inbox.put(('refused', reason))
+
+    def _on_client_notification(self, notification, interface):
+        # e.g. "Duty cycle limit exceeded. You can send again in 12 mins"
+        self._inbox.put(('notice', getattr(notification, 'message', str(notification))))
 
     def _on_connection_lost(self, interface):
         self._inbox.put(('lost', None))
@@ -564,13 +591,35 @@ class BridgeNode(Node):
                 self.handle_packet(packet)
             elif kind == 'pos':
                 self.publish_position(packet)
+            elif kind == 'refused':
+                self.refusals[packet] += 1
+            elif kind == 'notice':
+                self.log_notice(packet)
             elif kind == 'lost':
                 self.get_logger().error('Lost connection to Meshtastic device')
                 self.interface = None
                 # TODO: schedule reconnect.
+        self.log_refusals()
         for topic in self.tx_topics.values():
             self.send_if_due(topic)
         self.reassembler.expire()
+
+    def log_refusals(self):
+        """Summarize packets the radio refused to send, at most every REFUSAL_LOG_PERIOD_S."""
+        now = time.monotonic()
+        if not self.refusals or now - self.last_refusal_log < REFUSAL_LOG_PERIOD_S:
+            return
+        self.last_refusal_log = now
+        for reason, count in self.refusals.items():
+            hint = REFUSAL_HINTS.get(reason, 'see the Meshtastic routing error codes')
+            self.get_logger().warn(f'Radio refused {count} packet(s): {reason} ({hint})')
+        self.refusals.clear()
+
+    def log_notice(self, text):
+        now = time.monotonic()
+        if now - self.last_notices.get(text, 0.0) >= REFUSAL_LOG_PERIOD_S * 3:
+            self.last_notices[text] = now
+            self.get_logger().warn(f'Radio: {text}')
 
     def handle_packet(self, packet):
         sender = packet.get('fromId')
