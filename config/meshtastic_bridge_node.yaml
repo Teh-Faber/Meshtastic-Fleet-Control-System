@@ -89,6 +89,8 @@ meshtastic_bridge_node:
     # size verified to arrive (see codec.MAX_PAYLOAD_BYTES).
     max_payload_bytes: 221
     poll_hz: 20.0
+    # If the radio drops off (USB disconnect, power dip), retry this often.
+    reconnect_period_s: 5.0
 
     # Publish the radio's own GPS fix (sensor_msgs/NavSatFix), e.g. from a
     # T-Beam's GPS. Empty disables it. The firmware reports the position on

@@ -174,6 +174,7 @@ Defaults as in [`config/meshtastic_bridge_node.yaml`](../config/meshtastic_bridg
 | `port_num` | `PRIVATE_APP` | Meshtastic port number used by the bridge |
 | `max_payload_bytes` | `221` | Bridge bytes per LoRa packet. Larger messages are split into fragments. 233 (Meshtastic's nominal maximum) is rejected by the firmware on `PRIVATE_APP`, and 231 B packets didn't arrive in the link tests; 221 B is the largest size verified |
 | `poll_hz` | `20.0` | How often received packets are processed and due messages sent |
+| `reconnect_period_s` | `5.0` | If the radio drops off (USB disconnect, power dip) or isn't there at start-up, retry this often. Topics are re-announced once it's back |
 | `gps_topic` | `""` | Publish the radio's own GPS fix here as `sensor_msgs/NavSatFix` (boards with GPS, e.g. T-Beam). `""` disables it |
 
 ## Topics

@@ -194,6 +194,7 @@ Long test series run into the 10% duty cycle and then stop transmitting. Runs pa
 
 | Symptom | Fix |
 |---|---|
+| Communication stops after a while; the bridge logs `Lost connection to the Meshtastic device` | The radio dropped off USB, usually a power problem: on a Pi, `journalctl -k \| grep -i undervoltage` shows it. Use a proper supply (Pi 4: 5.1 V 3 A) or a powered USB hub, or put a charged 18650 in the T-Beam to buffer its transmit current. The bridge reconnects by itself every `reconnect_period_s` |
 | `Could not connect ...` and the connection **times out** | The board isn't running Meshtastic. Flash it ([step 2](#2-flash-meshtastic-onto-the-board)) |
 | `Could not connect ...` / permission denied | `sudo usermod -a -G dialout $USER`, then log out and in. Close the `meshtastic` CLI and serial monitors |
 | `No Meshtastic device found` / `Several possible devices found` | Plug the board in, or set `serial_port` (e.g. `/dev/ttyACM0`) |

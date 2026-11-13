@@ -48,6 +48,7 @@ meshtastic_bridge_node:
     port_num: PRIVATE_APP
     max_payload_bytes: 221
     poll_hz: 20.0
+    reconnect_period_s: 5.0
     # The link tests log the GPS positions of both ends (T-Beam boards) and
     # the distance between them. Boards without GPS simply report none.
     gps_topic: /mesh/gps/fix
