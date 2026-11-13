@@ -847,9 +847,16 @@ class BridgeNode(Node):
             self.send(codec.encode_request(tid), dest=sender)
 
     def publish_link_quality(self, sender, remote, msg_seq, packet):
-        # protobuf omits zero-valued fields, so hopStart may be missing.
+        # protobuf omits zero-valued fields: both missing means a packet sent
+        # with hop limit 0 (direct only), i.e. 0 hops. Only hopStart missing
+        # means firmware too old to report it: unknown.
         hop_start, hop_limit = packet.get('hopStart'), packet.get('hopLimit')
-        hops = '' if hop_start is None or hop_limit is None else str(hop_start - hop_limit)
+        if hop_start is None and hop_limit is None:
+            hops = '0'
+        elif hop_start is None:
+            hops = ''
+        else:
+            hops = str(hop_start - (hop_limit or 0))
         values = {
             'topic': remote.local_name,
             'source_topic': remote.source_topic,
