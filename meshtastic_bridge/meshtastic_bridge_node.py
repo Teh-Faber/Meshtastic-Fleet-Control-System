@@ -738,8 +738,23 @@ class BridgeNode(Node):
             self.last_notices[text] = now
             self.get_logger().warn(f'Radio: {text}')
 
+    @staticmethod
+    def sender_id(packet):
+        """
+        Return the sender's node id (``!a1b2c3d4``) of a received packet.
+
+        The library's ``fromId`` is None while the radio doesn't know the node
+        yet (after a radio reboot or reconnect, until its node info arrives),
+        so build it from the numeric ``from``, which is always there.
+        """
+        if packet.get('fromId'):
+            return packet['fromId']
+        if packet.get('from') is not None:
+            return f'!{packet["from"]:08x}'
+        return None
+
     def handle_packet(self, packet):
-        sender = packet.get('fromId')
+        sender = self.sender_id(packet)
         try:
             kind, fields = codec.decode(packet.get('decoded', {}).get('payload', b''))
         except ValueError as e:
