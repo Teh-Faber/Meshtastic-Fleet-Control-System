@@ -30,9 +30,10 @@ TEST_ARGS = {
     # Ramp: top data rate (payload bytes/s), split into ramp_steps evenly spaced steps.
     'max_rate_Bps': '600.0',
     'ramp_steps': '6',
-    # Ramp: top message rate, so small messages don't flood the radio.
-    'max_msg_rate': '4.0',
-    # 200 B is the largest test message that fits in one bridge packet (221 B).
+    # Ramp: top radio packet rate, so small or fragmented messages don't flood the radio.
+    'max_packet_rate': '4.0',
+    # Test message size. 200 B fits one 221 B bridge packet; up to 848 B with the
+    # default 4 fragments (raise max_fragments for more). Larger sizes are refused.
     'payload_size': '200',
     # Ramp: steps to keep going once goodput stops rising (0 = run every step).
     'overload_steps': '2',
@@ -57,6 +58,9 @@ def generate_launch_description():
         DeclareLaunchArgument('serial_port', default_value='auto'),
         DeclareLaunchArgument('device_name', default_value=''),
         DeclareLaunchArgument('start_bridge', default_value='true'),
+        # Bridge message size limits; empty keeps bridge_test.yaml (221 B, 4 packets).
+        DeclareLaunchArgument('max_payload_bytes', default_value=''),
+        DeclareLaunchArgument('max_fragments', default_value=''),
         *[DeclareLaunchArgument(name, default_value=value) for name, value in TEST_ARGS.items()],
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(os.path.join(share, 'launch', 'bridge.launch.py')),
@@ -64,6 +68,8 @@ def generate_launch_description():
                 'config': os.path.join(share, 'config', 'bridge_test.yaml'),
                 'serial_port': LaunchConfiguration('serial_port'),
                 'device_name': LaunchConfiguration('device_name'),
+                'max_payload_bytes': LaunchConfiguration('max_payload_bytes'),
+                'max_fragments': LaunchConfiguration('max_fragments'),
             }.items(),
             condition=IfCondition(LaunchConfiguration('start_bridge')),
         ),

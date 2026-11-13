@@ -13,11 +13,12 @@ Modes:
 - **Ramp** (default, ``interval_s:=0``): offers ``ramp_steps`` evenly
   spaced data rates up to ``max_rate_Bps``. With the defaults (600 B/s, 6
   steps) that is 100, 200, ... 600 B/s, i.e. 200 B messages every 2 s down
-  to every 0.33 s. ``max_msg_rate`` caps the top step in messages per
-  second (default 4), so small messages don't flood the radio at the same
-  B/s. Once goodput stops rising it does ``overload_steps`` more steps to
-  show the overload, then stops (``overload_steps:=0`` runs every step), and
-  logs the maximum goodput. With ``payload_sizes`` it ramps each size.
+  to every 0.33 s. ``max_packet_rate`` caps the top step in radio packets
+  per second (default 4), whatever the B/s, so neither small messages nor
+  messages split into several packets flood the radio. Once goodput stops
+  rising it does ``overload_steps`` more steps to show the overload, then
+  stops (``overload_steps:=0`` runs every step), and logs the maximum
+  goodput. With ``payload_sizes`` it ramps each size.
 - **Single run**: ``interval_s:=0.5`` sends one run at that interval.
 - **Sweep**: ``payload_sizes`` and ``intervals`` (comma separated, e.g.
   ``16,64,200``) run every combination, without stopping early.
@@ -32,9 +33,14 @@ real limit: delivery drops and goodput levels off at what the link carries.
 When the radio's queue is full the bridge blocks until a slot frees up, and
 messages published meanwhile are overwritten and count as lost.
 
-The default size of 200 B is the largest that still fits in one bridge
-packet (221 B with framing; larger messages are split into fragments, and
-losing one loses the message).
+Message size: ``payload_size`` (default 200 B) or ``payload_sizes``. The
+test asks the running bridge for its limits (``max_payload_bytes``,
+``max_fragments``; set them for both with the launch arguments of the same
+name) and works out how many radio packets each message takes, with the
+bridge's own codec. 200 B is the largest test message that fits in one
+221 B packet; larger ones are split into fragments (losing one loses the
+message), up to 848 B with the default 4 fragments. Sizes that don't fit
+are refused with the reason, since the bridge would drop them.
 
 If nothing arrives at a step before any step has succeeded, the ramp stops
 with an error: a faster rate can't help, the link or the message size is
@@ -53,14 +59,20 @@ import time
 
 from link_test_common import (append_summary, DATA, DATA_HEADER, format_duration, HostTest,
                               parse_list, REPORT, REPORT_REQUEST, run, TopicWatcher)
+from meshtastic_bridge import codec
+from rcl_interfaces.msg import ParameterType
+from rcl_interfaces.srv import GetParameters
+from rclpy.serialization import serialize_message
 from std_msgs.msg import String, UInt8MultiArray
 
 # The T-Beam sends at most a few packets per second on SHORT_FAST: its
 # 16-packet queue drains slowly, and the Meshtastic Python library sleeps
-# 0.1 s after every write, so it can't hand over more than ~10 messages/s.
+# 0.1 s after every write, so it can't hand over more than ~10 packets/s.
 # Offering far more than the radio drains only overwhelms it, so the ramp
-# tops out at max_rate_Bps (bytes/s) and max_msg_rate (messages/s).
-LIBRARY_MAX_MSG_RATE = 10.0
+# tops out at max_rate_Bps (bytes/s) and max_packet_rate (packets/s).
+LIBRARY_MAX_PACKET_RATE = 10.0
+# The bridge's limits if its parameters can't be read (bridge_test.yaml).
+DEFAULT_BRIDGE_LIMITS = {'max_payload_bytes': codec.MAX_PAYLOAD_BYTES, 'max_fragments': 4}
 # Goodput must rise by more than this to count as "still rising".
 RAMP_GAIN = 1.05
 # Fewest messages per run, whatever duration_s says.
@@ -81,24 +93,31 @@ class ThroughputTest(HostTest):
         self.duration_s = self.param('duration_s', 10.0)
         sizes = parse_list(self.param('payload_sizes', ''), int) or \
             [self.param('payload_size', 200)]
-        sizes = [max(DATA_HEADER.size, size) for size in sizes]
-        intervals = parse_list(self.param('intervals', ''), float)
-        interval_s = self.param('interval_s', 0.0)
+        self.sizes = [max(DATA_HEADER.size, size) for size in sizes]
+        self.intervals = parse_list(self.param('intervals', ''), float)
+        self.interval_s = self.param('interval_s', 0.0)
         # Ramp: top data rate (payload bytes/s) and number of evenly spaced steps.
         self.max_rate_Bps = self.param('max_rate_Bps', 600.0)
         self.ramp_steps = max(1, self.param('ramp_steps', 6))
-        # Ramp: top message rate, whatever max_rate_Bps allows for small messages.
-        self.max_msg_rate = self.param('max_msg_rate', 4.0)
-        if intervals:
+        # Ramp: top radio packet rate, whatever max_rate_Bps allows.
+        self.max_packet_rate = self.param('max_packet_rate', 4.0)
+        if self.intervals:
             self.mode = 'sweep'
-            self.runs = [(size, interval) for size in sizes for interval in intervals]
-        elif interval_s > 0:
+        elif self.interval_s > 0:
             self.mode = 'single'
-            self.runs = [(size, interval_s) for size in sizes]
         else:
             self.mode = 'ramp'
-            self.runs = [(size, interval) for size in sizes
-                         for interval in self.ramp_intervals(size)]
+        self.runs = []      # (payload size, interval), planned in start()
+        self.packets = {}   # payload size -> radio packets per message
+
+        # The bridge's message size limits, read from its parameters during
+        # the handshake (it runs in the same ROS graph).
+        self.bridge_limits = dict(DEFAULT_BRIDGE_LIMITS)
+        self.bridge_limits_source = 'defaults'
+        bridge_node = self.param('bridge_node', 'meshtastic_bridge_node')
+        self.param_client = self.create_client(GetParameters, f'/{bridge_node}/get_parameters')
+        self.param_future = None
+        self.param_timer = self.create_timer(1.0, self.query_bridge_limits)
         # 0: never stop a ramp early.
         self.overload_steps = self.param('overload_steps', 2)
         self.report_timeout_s = self.param('report_timeout_s', 30.0)
@@ -132,9 +151,77 @@ class ThroughputTest(HostTest):
         # Every run gets its own id; the echo device keeps counts per id.
         return (self.run_id + 1 + self.index) & 0xFFFF
 
+    def query_bridge_limits(self):
+        if self.param_future is None and self.param_client.service_is_ready():
+            request = GetParameters.Request(names=list(DEFAULT_BRIDGE_LIMITS))
+            self.param_future = self.param_client.call_async(request)
+            self.param_future.add_done_callback(self.on_bridge_limits)
+
+    def on_bridge_limits(self, future):
+        self.param_timer.cancel()
+        try:
+            values = future.result().values
+        except Exception as e:
+            self.get_logger().warn(f'Could not read the bridge limits ({e}), using defaults')
+            return
+        for name, value in zip(DEFAULT_BRIDGE_LIMITS, values):
+            if value.type == ParameterType.PARAMETER_INTEGER:
+                self.bridge_limits[name] = value.integer_value
+        self.bridge_limits_source = 'bridge'
+
+    def packets_per_message(self, size):
+        """Radio packets the bridge needs for one ``size``-byte test message, or None."""
+        serialized = serialize_message(UInt8MultiArray(data=bytes(size)))
+        try:
+            return len(codec.encode_data(0, 0, serialized,
+                                         self.bridge_limits['max_payload_bytes'],
+                                         self.bridge_limits['max_fragments']))
+        except ValueError:
+            return None
+
+    def largest_payload(self):
+        """Largest test payload the bridge sends with its current limits."""
+        low, high = DATA_HEADER.size, 64 * 1024
+        while low < high:
+            mid = (low + high + 1) // 2
+            low, high = (mid, high) if self.packets_per_message(mid) else (low, mid - 1)
+        return low
+
+    def plan_runs(self):
+        """Work out packets per message and the runs; refuse sizes that don't fit."""
+        log = self.get_logger()
+        limits = self.bridge_limits
+        largest = self.largest_payload()
+        log.info(f'Bridge limits ({self.bridge_limits_source}): '
+                 f'{limits["max_payload_bytes"]} B per packet, up to '
+                 f'{limits["max_fragments"]} packets per message, so test messages up to '
+                 f'{largest} B (single packet up to {self.largest_single_packet()} B)')
+        for size in self.sizes:
+            packets = self.packets_per_message(size)
+            if packets is None:
+                log.error(f'{size} B messages need more than {limits["max_fragments"]} packets '
+                          f'and would be dropped by the bridge; skipping (largest is {largest} B, '
+                          'or raise max_fragments)')
+                continue
+            self.packets[size] = packets
+        sizes = [size for size in self.sizes if size in self.packets]
+        if self.mode == 'sweep':
+            self.runs = [(size, interval) for size in sizes for interval in self.intervals]
+        elif self.mode == 'single':
+            self.runs = [(size, self.interval_s) for size in sizes]
+        else:
+            self.runs = [(size, interval) for size in sizes
+                         for interval in self.ramp_intervals(size)]
+
+    def largest_single_packet(self):
+        size = DATA_HEADER.size
+        while self.packets_per_message(size + 1) == 1:
+            size += 1
+        return size
+
     def ramp_intervals(self, size):
         """Intervals of the ramp for ``size``-byte messages, slowest first."""
-        top_Bps = min(self.max_rate_Bps, self.max_msg_rate * size)
+        top_Bps = min(self.max_rate_Bps, self.max_packet_rate * size / self.packets[size])
         return [size / (top_Bps * step / self.ramp_steps)
                 for step in range(1, self.ramp_steps + 1)]
 
@@ -145,6 +232,14 @@ class ThroughputTest(HostTest):
 
     def start(self):
         self.t_start = time.monotonic()
+        if self.param_future is None or not self.param_future.done():
+            self.get_logger().warn('Bridge parameters not readable yet, assuming its defaults')
+        self.param_timer.cancel()
+        self.plan_runs()
+        if not self.runs:
+            self.get_logger().error('No message size left to test')
+            self.done = True
+            return
         send_s = sum(self.run_count(interval) * interval for _, interval in self.runs)
         overhead_s = len(self.runs) * (REPORT_DELAY_S + 1.0 + self.pause_s)
         log = self.get_logger()
@@ -152,7 +247,8 @@ class ThroughputTest(HostTest):
             tops = []
             for size in dict.fromkeys(size for size, _ in self.runs):
                 fastest = min(interval for s, interval in self.runs if s == size)
-                tops.append(f'{size} B up to {size / fastest:.0f} B/s')
+                tops.append(f'{size} B ({self.packets[size]} packet(s)) up to '
+                            f'{size / fastest:.0f} B/s')
             stop = ('runs every step' if self.overload_steps == 0
                     else f'stops {self.overload_steps} steps after saturating')
             what = f'ramp in {self.ramp_steps} steps, {", ".join(tops)}, {stop}'
@@ -160,11 +256,11 @@ class ThroughputTest(HostTest):
             what = {'single': 'single run', 'sweep': 'sweep'}[self.mode]
         log.info(f'Throughput ({what}): up to {len(self.runs)} run(s), '
                  f'at most {format_duration(send_s + overhead_s)}')
-        top_msg_rate = max(1.0 / interval for _, interval in self.runs)
-        if top_msg_rate > LIBRARY_MAX_MSG_RATE:
-            log.warn(f'Top step is {top_msg_rate:.1f} messages/s; the Meshtastic Python library '
-                     f'hands at most ~{LIBRARY_MAX_MSG_RATE:.0f}/s to the radio, the rest is '
-                     'overwritten in the bridge')
+        top_packet_rate = max(self.packets[size] / interval for size, interval in self.runs)
+        if top_packet_rate > LIBRARY_MAX_PACKET_RATE:
+            log.warn(f'Top step is {top_packet_rate:.1f} packets/s; the Meshtastic Python '
+                     f'library hands at most ~{LIBRARY_MAX_PACKET_RATE:.0f}/s to the radio, the '
+                     'rest is overwritten in the bridge')
         self.create_timer(0.1, self.control)
         self.next_run()
 
@@ -185,7 +281,8 @@ class ThroughputTest(HostTest):
         self.t_last_progress = time.monotonic()
         self.get_logger().info(
             f'{self.run_label()}: offering {size / interval:.0f} B/s = {self.count} x {size} B '
-            f'every {interval:.2f}s ({1 / interval:.1f} msg/s, '
+            f'every {interval:.2f}s ({1 / interval:.1f} msg/s = '
+            f'{self.packets[size] / interval:.1f} packets/s, '
             f'~{format_duration(self.count * interval)})')
         self.send_timer = self.create_timer(interval, self.send_one)
 
@@ -306,6 +403,8 @@ class ThroughputTest(HostTest):
             'mode': self.mode,
             'payload_size': size,
             'interval_s': round(interval, 3),
+            'packets_per_msg': self.packets.get(size),
+            'offered_packets_s': round(self.packets.get(size, 1) / interval, 2),
             'offered_Bps': round(size / interval, 1),
             'sent': self.seq,
             'received': received,

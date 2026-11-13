@@ -40,6 +40,9 @@ def generate_launch_description():
         DeclareLaunchArgument('serial_port', default_value='auto'),
         DeclareLaunchArgument('device_name', default_value=''),
         DeclareLaunchArgument('start_bridge', default_value='true'),
+        # Bridge message size limits; empty keeps bridge_test.yaml (221 B, 4 packets).
+        DeclareLaunchArgument('max_payload_bytes', default_value=''),
+        DeclareLaunchArgument('max_fragments', default_value=''),
         *[DeclareLaunchArgument(name, default_value=value) for name, value in TEST_ARGS.items()],
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(os.path.join(share, 'launch', 'bridge.launch.py')),
@@ -47,6 +50,8 @@ def generate_launch_description():
                 'config': os.path.join(share, 'config', 'bridge_test.yaml'),
                 'serial_port': LaunchConfiguration('serial_port'),
                 'device_name': LaunchConfiguration('device_name'),
+                'max_payload_bytes': LaunchConfiguration('max_payload_bytes'),
+                'max_fragments': LaunchConfiguration('max_fragments'),
             }.items(),
             condition=IfCondition(LaunchConfiguration('start_bridge')),
         ),
