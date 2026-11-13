@@ -65,6 +65,10 @@ REFUSAL_LOG_PERIOD_S = 10.0
 # of a burst was regularly lost (the receiving radio was busy, e.g.
 # rebroadcasting the previous packet), so a topic stayed unknown remotely.
 ANNOUNCE_SPACING_S = 0.3
+# Warn when handing one packet to the radio takes longer than this: the
+# Meshtastic library blocks (and with it this whole node) while the radio's
+# transmit queue is full, so nothing is received or published meanwhile.
+SEND_STALL_WARN_S = 5.0
 # Ask a device again for a topic it hasn't announced after this long.
 REQUEST_RETRY_S = 5.0
 # Answer requests for one topic at most this often (several devices may ask).
@@ -513,6 +517,7 @@ class BridgeNode(Node):
         if self.interface is None:
             self.get_logger().warn('Not connected, dropping packet', throttle_duration_sec=5.0)
             return
+        t_start = time.monotonic()
         try:
             self.interface.sendData(
                 payload,
@@ -523,6 +528,13 @@ class BridgeNode(Node):
             )
         except Exception as e:
             self.get_logger().error(f'sendData failed: {e}', throttle_duration_sec=5.0)
+        blocked = time.monotonic() - t_start
+        if blocked > SEND_STALL_WARN_S:
+            self.get_logger().warn(
+                f'Sending one packet blocked for {blocked:.0f}s waiting for the radio\'s '
+                'transmit queue; nothing was received or published meanwhile. The radio may '
+                'be over its duty cycle, busy, or hung (power-cycle it if this repeats)',
+                throttle_duration_sec=30.0)
 
     def _on_receive(self, packet, interface):
         portnum = packet.get('decoded', {}).get('portnum')
