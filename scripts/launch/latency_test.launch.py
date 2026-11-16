@@ -2,7 +2,7 @@
 Launch the bridge and the latency test on the host. The peer runs echo_device.launch.py.
 
 Run with:
-  ros2 launch meshtastic_bridge latency_test.launch.py label:=500m count:=50
+  ros2 launch meshtastic_bridge latency_test.launch.py label:=500m count:=20
 """
 
 import os
@@ -19,11 +19,14 @@ SCRIPT = 'latency_test.py'
 # Test parameters exposed as launch arguments: name -> default.
 TEST_ARGS = {
     'label': 'unlabeled',
-    'count': '50',
-    'interval_s': '5.0',
-    'timeout_s': '30.0',
+    'count': '20',
+    # Minimum time between pings; the next one goes out once the previous is answered.
+    'interval_s': '1.0',
+    'timeout_s': '10.0',
     'payload_size': '0',
-    'output_dir': '~/fleet_test_results',
+    'handshake_timeout_s': '60.0',
+    # '' writes to <workspace>/results (or $FLEET_RESULTS_DIR).
+    'output_dir': "''",
 }
 
 
@@ -37,6 +40,11 @@ def generate_launch_description():
         DeclareLaunchArgument('serial_port', default_value='auto'),
         DeclareLaunchArgument('device_name', default_value=''),
         DeclareLaunchArgument('start_bridge', default_value='true'),
+        # Bridge message size limits; empty keeps bridge_test.yaml (221 B, 4 packets).
+        DeclareLaunchArgument('max_payload_bytes', default_value=''),
+        DeclareLaunchArgument('max_fragments', default_value=''),
+        # true: the bridge sends with hop limit 0, so the other radio doesn't rebroadcast.
+        DeclareLaunchArgument('direct_only', default_value=''),
         *[DeclareLaunchArgument(name, default_value=value) for name, value in TEST_ARGS.items()],
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(os.path.join(share, 'launch', 'bridge.launch.py')),
@@ -44,6 +52,9 @@ def generate_launch_description():
                 'config': os.path.join(share, 'config', 'bridge_test.yaml'),
                 'serial_port': LaunchConfiguration('serial_port'),
                 'device_name': LaunchConfiguration('device_name'),
+                'max_payload_bytes': LaunchConfiguration('max_payload_bytes'),
+                'max_fragments': LaunchConfiguration('max_fragments'),
+                'direct_only': LaunchConfiguration('direct_only'),
             }.items(),
             condition=IfCondition(LaunchConfiguration('start_bridge')),
         ),

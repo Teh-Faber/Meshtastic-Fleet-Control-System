@@ -1,38 +1,133 @@
 #!/usr/bin/env python3
 """
-Measure delivered data rate to the echo device.
+Measure delivered data rate to the echo device, up to and past the link's limit.
 
-Publishes ``count`` messages of ``payload_size`` bytes on
-``/link_test/data`` (std_msgs/UInt8MultiArray) every ``interval_s``, then
-asks the echo device how many arrived (``/link_test/report_request``,
-repeated until ``/<peer>/link_test/report`` comes back).
+Each run publishes messages of a given size on ``/link_test/data``
+(std_msgs/UInt8MultiArray) at a fixed interval for ``duration_s`` (or
+``count`` messages), then asks the echo device how many arrived
+(``/link_test/report_request``, repeated until ``/<peer>/link_test/report``
+comes back).
 
-The bridge keeps only the latest message per topic, so messages published
-faster than the radio can send are overwritten and count as lost. Finding
-that point is the goal of this test; sweep it with
-scripts/sweep_throughput.sh. Mind the EU868 duty-cycle limits.
+Modes:
 
-Appends a one-line result to ``throughput_summary.csv``, with both GPS
-positions and their distance when the T-Beams have a fix (the echo device's
-position comes with its report).
+- **Ramp** (default, ``interval_s:=0``): offers ``ramp_steps`` evenly
+  spaced data rates up to ``max_rate_Bps``. With the defaults (800 B/s, 6
+  steps) that is 133, 267, ... 800 B/s, i.e. 200 B messages every 1.5 s down
+  to every 0.25 s; a T-Beam pair on SHORT_FAST carries ~550-580 B/s.
+  ``max_packet_rate`` caps the top step in radio packets per second
+  (default 4), whatever the B/s, so neither small messages nor messages
+  split into several packets flood the radio. Once goodput stops
+  rising it does ``overload_steps`` more steps to show the overload, then
+  stops (``overload_steps:=0`` runs every step), and logs the maximum
+  goodput. With ``payload_sizes`` it ramps each size.
+- **Single run**: ``interval_s:=0.5`` sends one run at that interval.
+- **Sweep**: ``payload_sizes`` and ``intervals`` (comma separated, e.g.
+  ``16,64,200``) run every combination, without stopping early.
+
+All runs share one bridge connection, so the bridge start and the handshake
+happen once.
+
+Why runs last ``duration_s`` rather than a few messages: the radio buffers
+about 16 packets, so a short burst is absorbed by the queue and still
+arrives in full after the burst. Runs long enough to overflow it show the
+real limit: delivery drops and goodput levels off at what the link carries.
+When the radio's queue is full the bridge blocks until a slot frees up, and
+messages published meanwhile are overwritten and count as lost.
+
+Message size: ``payload_size`` (default 200 B) or ``payload_sizes``. The
+test asks the running bridge for its limits (``max_payload_bytes``,
+``max_fragments``; set them for both with the launch arguments of the same
+name) and works out how many radio packets each message takes, with the
+bridge's own codec. 200 B is the largest test message that fits in one
+221 B packet; larger ones are split into fragments (losing one loses the
+message), up to 848 B with the default 4 fragments. Sizes that don't fit
+are refused with the reason, since the bridge would drop them.
+
+If nothing arrives at a step before any step has succeeded, the ramp stops
+with an error: a faster rate can't help, the link or the message size is
+the problem.
+
+Logs progress while sending and one result line per run. Appends one row
+per run to ``throughput_summary.csv``, with both GPS positions and their
+distance when the T-Beams have a fix (the echo device's position comes with
+its report). Mind the EU868 duty-cycle limits: runs past the limit keep the
+radio transmitting the whole time.
 """
 
 import json
+import math
 import time
 
-from link_test_common import (append_summary, DATA, DATA_HEADER, HostTest, REPORT,
-                              REPORT_REQUEST, run, TopicWatcher)
+from link_test_common import (append_summary, DATA, DATA_HEADER, format_duration, HostTest,
+                              parse_list, REPORT, REPORT_REQUEST, run, TopicWatcher)
+from meshtastic_bridge import codec
+from rcl_interfaces.msg import ParameterType
+from rcl_interfaces.srv import GetParameters
+from rclpy.serialization import serialize_message
 from std_msgs.msg import String, UInt8MultiArray
+
+# The T-Beam sends at most a few packets per second on SHORT_FAST: its
+# 16-packet queue drains slowly, and the Meshtastic Python library sleeps
+# 0.1 s after every write, so it can't hand over more than ~10 packets/s.
+# Offering far more than the radio drains only overwhelms it, so the ramp
+# tops out at max_rate_Bps (bytes/s) and max_packet_rate (packets/s).
+LIBRARY_MAX_PACKET_RATE = 10.0
+# The bridge's limits if its parameters can't be read (bridge_test.yaml).
+DEFAULT_BRIDGE_LIMITS = {'max_payload_bytes': codec.MAX_PAYLOAD_BYTES, 'max_fragments': 4}
+# Goodput must rise by more than this to count as "still rising".
+RAMP_GAIN = 1.05
+# Fewest messages per run, whatever duration_s says.
+MIN_COUNT = 5
+# Wait this long after the last message before the first report request.
+REPORT_DELAY_S = 1.0
+REPORT_RETRY_S = 2.0
+# After the first report, ask once more this long later and keep the higher
+# count: the last messages of a run may still have been in flight.
+REPORT_CONFIRM_S = 2.0
+REPORT_CONFIRM_TIMEOUT_S = 6.0
+# Log sending progress at most this often.
+PROGRESS_PERIOD_S = 5.0
 
 
 class ThroughputTest(HostTest):
 
     def __init__(self):
         super().__init__('throughput_test')
-        self.count = self.param('count', 50)
-        self.interval_s = self.param('interval_s', 2.0)
-        self.payload_size = max(DATA_HEADER.size, self.param('payload_size', 200))
-        self.report_timeout_s = self.param('report_timeout_s', 60.0)
+        # 0: derive each run's count from duration_s.
+        self.fixed_count = self.param('count', 0)
+        self.duration_s = self.param('duration_s', 10.0)
+        sizes = parse_list(self.param('payload_sizes', ''), int) or \
+            [self.param('payload_size', 200)]
+        self.sizes = [max(DATA_HEADER.size, size) for size in sizes]
+        self.intervals = parse_list(self.param('intervals', ''), float)
+        self.interval_s = self.param('interval_s', 0.0)
+        # Ramp: top data rate (payload bytes/s) and number of evenly spaced steps.
+        self.max_rate_Bps = self.param('max_rate_Bps', 800.0)
+        self.ramp_steps = max(1, self.param('ramp_steps', 6))
+        # Ramp: top radio packet rate, whatever max_rate_Bps allows.
+        self.max_packet_rate = self.param('max_packet_rate', 4.0)
+        if self.intervals:
+            self.mode = 'sweep'
+        elif self.interval_s > 0:
+            self.mode = 'single'
+        else:
+            self.mode = 'ramp'
+        self.runs = []      # (payload size, interval), planned in start()
+        self.packets = {}   # payload size -> radio packets per message
+
+        # The bridge's message size limits, read from its parameters during
+        # the handshake (it runs in the same ROS graph).
+        self.bridge_limits = dict(DEFAULT_BRIDGE_LIMITS)
+        self.bridge_limits_source = 'defaults'
+        bridge_node = self.param('bridge_node', 'meshtastic_bridge_node')
+        self.param_client = self.create_client(GetParameters, f'/{bridge_node}/get_parameters')
+        self.param_future = None
+        self.param_timer = self.create_timer(1.0, self.query_bridge_limits)
+        # 0: never stop a ramp early.
+        self.overload_steps = self.param('overload_steps', 2)
+        self.report_timeout_s = self.param('report_timeout_s', 30.0)
+        # Lets the radio's transmit queue drain between runs.
+        self.pause_s = self.param('pause_s', 2.0)
 
         # Created before the handshake so the bridge has already announced
         # these topics when the measured part starts.
@@ -40,78 +135,372 @@ class ThroughputTest(HostTest):
         self.request_pub = self.create_publisher(String, REPORT_REQUEST, 10)
         self.report_watcher = TopicWatcher(self, REPORT, String, self.on_report)
 
+        self.index = -1        # current run
+        self.state = None      # 'send', 'report', 'pause'
+        self.state_since = 0.0
+        self.send_timer = None
         self.seq = 0
-        self.t_start = None
-        self.t_end = None
+        self.count = 0
         self.report = None
+        self.t_first_report = 0.0
+        self.confirm_sent = False
+        self.confirmed = False
+        self.t_start = None
+        self.t_last_progress = 0.0
+        self.t_next_request = 0.0
+        self.summary_path = None
+        self.results = []      # summary rows of the finished runs
+        self.ramp = {}         # payload size -> {'best': row, 'beyond': n, 'done': bool}
+
+    # --- run sequencing --------------------------------------------------
+
+    @property
+    def run_id_now(self):
+        # Every run gets its own id; the echo device keeps counts per id.
+        return (self.run_id + 1 + self.index) & 0xFFFF
+
+    def query_bridge_limits(self):
+        if self.param_future is None and self.param_client.service_is_ready():
+            request = GetParameters.Request(names=list(DEFAULT_BRIDGE_LIMITS))
+            self.param_future = self.param_client.call_async(request)
+            self.param_future.add_done_callback(self.on_bridge_limits)
+
+    def on_bridge_limits(self, future):
+        self.param_timer.cancel()
+        try:
+            values = future.result().values
+        except Exception as e:
+            self.get_logger().warn(f'Could not read the bridge limits ({e}), using defaults')
+            return
+        for name, value in zip(DEFAULT_BRIDGE_LIMITS, values):
+            if value.type == ParameterType.PARAMETER_INTEGER:
+                self.bridge_limits[name] = value.integer_value
+        self.bridge_limits_source = 'bridge'
+
+    def packets_per_message(self, size):
+        """Radio packets the bridge needs for one ``size``-byte test message, or None."""
+        serialized = serialize_message(UInt8MultiArray(data=bytes(size)))
+        try:
+            return len(codec.encode_data(0, 0, serialized,
+                                         self.bridge_limits['max_payload_bytes'],
+                                         self.bridge_limits['max_fragments']))
+        except ValueError:
+            return None
+
+    def largest_payload(self):
+        """Largest test payload the bridge sends with its current limits."""
+        low, high = DATA_HEADER.size, 64 * 1024
+        while low < high:
+            mid = (low + high + 1) // 2
+            low, high = (mid, high) if self.packets_per_message(mid) else (low, mid - 1)
+        return low
+
+    def plan_runs(self):
+        """Work out packets per message and the runs; refuse sizes that don't fit."""
+        log = self.get_logger()
+        limits = self.bridge_limits
+        largest = self.largest_payload()
+        log.info(f'Bridge limits ({self.bridge_limits_source}): '
+                 f'{limits["max_payload_bytes"]} B per packet, up to '
+                 f'{limits["max_fragments"]} packets per message, so test messages up to '
+                 f'{largest} B (single packet up to {self.largest_single_packet()} B)')
+        for size in self.sizes:
+            packets = self.packets_per_message(size)
+            if packets is None:
+                log.error(f'{size} B messages need more than {limits["max_fragments"]} packets '
+                          f'and would be dropped by the bridge; skipping (largest is {largest} B, '
+                          'or raise max_fragments)')
+                continue
+            self.packets[size] = packets
+        sizes = [size for size in self.sizes if size in self.packets]
+        if self.mode == 'sweep':
+            self.runs = [(size, interval) for size in sizes for interval in self.intervals]
+        elif self.mode == 'single':
+            self.runs = [(size, self.interval_s) for size in sizes]
+        else:
+            self.runs = [(size, interval) for size in sizes
+                         for interval in self.ramp_intervals(size)]
+
+    def largest_single_packet(self):
+        size = DATA_HEADER.size
+        while self.packets_per_message(size + 1) == 1:
+            size += 1
+        return size
+
+    def ramp_intervals(self, size):
+        """Intervals of the ramp for ``size``-byte messages, slowest first."""
+        top_Bps = min(self.max_rate_Bps, self.max_packet_rate * size / self.packets[size])
+        return [size / (top_Bps * step / self.ramp_steps)
+                for step in range(1, self.ramp_steps + 1)]
+
+    def raise_hint(self, size):
+        """Which cap ended the ramp for ``size``, and what to raise it to."""
+        packet_cap_Bps = self.max_packet_rate * size / self.packets[size]
+        packet_hint = f'max_packet_rate (e.g. to {self.max_packet_rate * 1.5:g})'
+        rate_hint = f'max_rate_Bps (e.g. to {self.max_rate_Bps * 1.5:.0f})'
+        if math.isclose(packet_cap_Bps, self.max_rate_Bps):
+            return f'Raise both {packet_hint} and {rate_hint}'
+        if packet_cap_Bps < self.max_rate_Bps:
+            return (f'Raise {packet_hint}; the top step was capped at '
+                    f'{self.max_packet_rate:g} packets/s')
+        return f'Raise {rate_hint}'
+
+    def run_count(self, interval):
+        if self.fixed_count > 0:
+            return self.fixed_count
+        return max(MIN_COUNT, math.ceil(self.duration_s / interval))
 
     def start(self):
         self.t_start = time.monotonic()
-        self.create_timer(self.interval_s, self.tick)
-        self.get_logger().info(
-            f'Throughput: {self.count} x {self.payload_size} B every {self.interval_s}s '
-            f'(offered {self.payload_size / self.interval_s:.1f} B/s)')
-
-    def tick(self):
-        if self.seq < self.count:
-            header = DATA_HEADER.pack(self.run_id, self.seq, self.count)
-            payload = header + bytes(self.payload_size - len(header))
-            self.data_pub.publish(UInt8MultiArray(data=list(payload)))
-            self.seq += 1
-            return
-        if self.t_end is None:
-            self.t_end = time.monotonic()
-            self.create_timer(3.0, self.request_report)
-            self.get_logger().info('All data sent, requesting report')
-
-    def request_report(self):
-        if self.report is not None:
-            return
-        if time.monotonic() - self.t_end > self.report_timeout_s:
-            self.get_logger().error('No report from the echo device')
+        if self.param_future is None or not self.param_future.done():
+            self.get_logger().warn('Bridge parameters not readable yet, assuming its defaults')
+        self.param_timer.cancel()
+        self.plan_runs()
+        if not self.runs:
+            self.get_logger().error('No message size left to test')
             self.done = True
             return
-        self.request_pub.publish(String(data=str(self.run_id)))
+        send_s = sum(self.run_count(interval) * interval for _, interval in self.runs)
+        overhead_s = len(self.runs) * (REPORT_DELAY_S + 1.0 + self.pause_s)
+        log = self.get_logger()
+        if self.mode == 'ramp':
+            tops = []
+            for size in dict.fromkeys(size for size, _ in self.runs):
+                fastest = min(interval for s, interval in self.runs if s == size)
+                tops.append(f'{size} B ({self.packets[size]} packet(s)) up to '
+                            f'{size / fastest:.0f} B/s')
+            stop = ('runs every step' if self.overload_steps == 0
+                    else f'stops {self.overload_steps} steps after saturating')
+            what = f'ramp in {self.ramp_steps} steps, {", ".join(tops)}, {stop}'
+        else:
+            what = {'single': 'single run', 'sweep': 'sweep'}[self.mode]
+        log.info(f'Throughput ({what}): up to {len(self.runs)} run(s), '
+                 f'at most {format_duration(send_s + overhead_s)}')
+        top_packet_rate = max(self.packets[size] / interval for size, interval in self.runs)
+        if top_packet_rate > LIBRARY_MAX_PACKET_RATE:
+            log.warn(f'Top step is {top_packet_rate:.1f} packets/s; the Meshtastic Python '
+                     f'library hands at most ~{LIBRARY_MAX_PACKET_RATE:.0f}/s to the radio, the '
+                     'rest is overwritten in the bridge')
+        self.create_timer(0.1, self.control)
+        self.next_run()
+
+    def next_run(self):
+        self.index += 1
+        # A finished ramp skips the rest of its steps.
+        while (self.index < len(self.runs)
+               and self.ramp.get(self.runs[self.index][0], {}).get('done')):
+            self.index += 1
+        if self.index >= len(self.runs):
+            self.done = True
+            return
+        size, interval = self.runs[self.index]
+        self.count = self.run_count(interval)
+        self.seq = 0
+        self.report = None
+        self.confirm_sent = self.confirmed = False
+        self.set_state('send')
+        self.t_last_progress = time.monotonic()
+        self.get_logger().info(
+            f'{self.run_label()}: offering {size / interval:.0f} B/s = {self.count} x {size} B '
+            f'every {interval:.2f}s ({1 / interval:.1f} msg/s = '
+            f'{self.packets[size] / interval:.1f} packets/s, '
+            f'~{format_duration(self.count * interval)})')
+        self.send_timer = self.create_timer(interval, self.send_one)
+
+    def set_state(self, state):
+        self.state = state
+        self.state_since = time.monotonic()
+
+    def run_label(self):
+        return f'Run {self.index + 1}/{len(self.runs)}'
+
+    def send_one(self):
+        size, _ = self.runs[self.index]
+        header = DATA_HEADER.pack(self.run_id_now, self.seq, self.count)
+        payload = header + bytes(size - len(header))
+        self.data_pub.publish(UInt8MultiArray(data=list(payload)))
+        self.seq += 1
+        now = time.monotonic()
+        if self.seq >= self.count:
+            self.destroy_timer(self.send_timer)
+            self.send_timer = None
+            self.set_state('report')
+            self.t_next_request = now + REPORT_DELAY_S
+            self.get_logger().info(f'{self.run_label()}: all sent, asking the echo device')
+        elif now - self.t_last_progress >= PROGRESS_PERIOD_S:
+            self.t_last_progress = now
+            self.get_logger().info(f'{self.run_label()}: sent {self.seq}/{self.count}')
+
+    def control(self):
+        now = time.monotonic()
+        if self.state == 'report':
+            if self.report is not None:
+                if self.confirmed or now - self.t_first_report > REPORT_CONFIRM_TIMEOUT_S:
+                    self.finish_run('ok')
+                elif not self.confirm_sent and now - self.t_first_report >= REPORT_CONFIRM_S:
+                    self.request_pub.publish(String(data=str(self.run_id_now)))
+                    self.confirm_sent = True
+            elif now - self.state_since > self.report_timeout_s:
+                self.get_logger().error(
+                    f'{self.run_label()}: no report from the echo device within '
+                    f'{self.report_timeout_s:.0f}s')
+                self.finish_run('no_report')
+            elif now >= self.t_next_request:
+                self.request_pub.publish(String(data=str(self.run_id_now)))
+                self.t_next_request = now + REPORT_RETRY_S
+        elif self.state == 'pause' and now - self.state_since >= self.pause_s:
+            self.next_run()
 
     def on_report(self, device, msg):
         try:
             report = json.loads(msg.data)
         except ValueError:
             return
-        if report.get('run_id') != self.run_id or self.report is not None:
+        if self.state != 'report' or report.get('run_id') != self.run_id_now:
             return
-        self.report = report
-        self.done = True
+        if self.report is None:
+            self.report = report
+            self.t_first_report = time.monotonic()
+        elif self.confirm_sent:
+            # Counts only grow, so the higher one is the more complete report.
+            if report.get('received', 0) > self.report.get('received', 0):
+                self.get_logger().info(
+                    f'{self.run_label()}: {report["received"] - self.report["received"]} more '
+                    'message(s) arrived after the first report (still in flight)')
+                self.report = report
+            self.confirmed = True
 
-    def finish(self):
-        if self.t_start is None:
-            return  # handshake never completed
+    # --- results -----------------------------------------------------------
+
+    def finish_run(self, status):
+        row = self.write_row(status)
+        self.results.append(row)
+        if row['received'] is None:
+            delivered = 'no report'
+        else:
+            delivered = f'delivered {row["received"]}/{row["sent"]} ({row["pdr"]:.0%})'
+        details = [f'goodput {row["goodput_Bps"]} B/s' if row['goodput_Bps'] else '',
+                   f'RSSI {row["rssi_mean"]} dBm' if row['rssi_mean'] is not None else '',
+                   f'SNR {row["snr_mean"]} dB' if row['snr_mean'] is not None else '',
+                   f'{row["distance_m"]:.0f} m' if row['distance_m'] is not None else '']
+        self.get_logger().info(
+            f'{self.run_label()}: {delivered}' + ''.join(f', {d}' for d in details if d))
+        if self.mode == 'ramp':
+            self.update_ramp(row)
+        self.set_state('pause')
+        if self.index + 1 >= len(self.runs):
+            self.next_run()  # last run: no pause
+
+    def update_ramp(self, row):
+        """Track the best goodput per size; stop a size's ramp once past the limit."""
+        size = row['payload_size']
+        ramp = self.ramp.setdefault(
+            size, {'best': None, 'beyond': 0, 'done': False, 'failed': False, 'dropped': False})
+        best = ramp['best']
+        if not row['received'] and best is None:
+            # Nothing has arrived at this size yet, at the slowest rate so far.
+            ramp['done'] = ramp['failed'] = True
+            self.get_logger().error(
+                f'Nothing arrived at {row["interval_s"]}s intervals, the slowest step: a '
+                'faster rate cannot help. Check that the echo device is running and in '
+                f'range, and that {size} B messages fit (try payload_size:=100)')
+            return
+        goodput = row['goodput_Bps'] or 0.0
+        best_goodput = (best['goodput_Bps'] or 0.0) if best else 0.0
+        if best is None or goodput > best_goodput * RAMP_GAIN:
+            ramp['best'], ramp['beyond'] = row, 0
+            return
+        if goodput > best_goodput:
+            ramp['best'] = row  # slightly higher, but no longer rising
+        elif goodput < best_goodput / RAMP_GAIN:
+            # Offering more delivered clearly less: the link is past its limit.
+            ramp['dropped'] = True
+        ramp['beyond'] += 1
+        if ramp['beyond'] == 1:
+            self.get_logger().info(
+                f'Goodput stopped rising: link saturated at about '
+                f'{ramp["best"]["goodput_Bps"]} B/s')
+        if self.overload_steps and ramp['beyond'] >= self.overload_steps:
+            ramp['done'] = True
+            self.get_logger().info(
+                f'{self.overload_steps} step(s) past the limit, ending the ramp')
+
+    def write_row(self, status):
+        size, interval = self.runs[self.index]
         report = self.report or {}
         received = report.get('received')
         span = report.get('span_s') or 0.0
-        goodput = report.get('bytes', 0) / span if span > 0 else None
+        # span runs from the first to the last arrival, i.e. covers n - 1
+        # messages' worth of time: leave the first message's bytes out.
+        goodput = None
+        if span > 0 and received and received > 1:
+            goodput = report.get('bytes', 0) * (received - 1) / received / span
         row = {
             'time': time.strftime('%Y-%m-%d %H:%M:%S'),
             'label': self.label,
             'peer': self.peer,
-            'payload_size': self.payload_size,
-            'interval_s': self.interval_s,
-            'offered_Bps': round(self.payload_size / self.interval_s, 1),
+            'mode': self.mode,
+            'payload_size': size,
+            'interval_s': round(interval, 3),
+            'packets_per_msg': self.packets.get(size),
+            'offered_packets_s': round(self.packets.get(size, 1) / interval, 2),
+            'offered_Bps': round(size / interval, 1),
             'sent': self.seq,
             'received': received,
             'pdr': round(received / self.seq, 3) if received is not None and self.seq else None,
             'goodput_Bps': round(goodput, 1) if goodput else None,
+            'delivered_msg_s': round(goodput / size, 2) if goodput else None,
             # Link quality as measured by the echo device (host -> echo).
             'rssi_mean': report.get('rssi_mean'),
             'snr_mean': report.get('snr_mean'),
             'hops': report.get('hops'),
             **self.position_fields(report.get('position')),
+            'status': status,
         }
-        path = append_summary(self.output_dir, 'throughput', row)
-        self.get_logger().info(
-            f'Delivered {received}/{self.seq}, goodput {row["goodput_Bps"]} B/s, '
-            f'rssi {row["rssi_mean"]} snr {row["snr_mean"]}, distance {row["distance_m"]} m. '
-            f'Summary in {path}')
+        self.summary_path = append_summary(self.output_dir, 'throughput', row)
+        return row
+
+    def finish(self):
+        if self.t_start is None:
+            return  # handshake never completed
+        if self.state in ('send', 'report') and self.index < len(self.runs):
+            self.write_row('interrupted')
+        log = self.get_logger()
+        log.info(f'Throughput done: {len(self.results)} run(s) in '
+                 f'{format_duration(time.monotonic() - self.t_start)}')
+        if len(self.results) > 1:
+            log.info('  size  interval   offered  delivered        goodput')
+            for row in self.results:
+                pdr = f'{row["pdr"]:.0%}' if row['pdr'] is not None else '-'
+                delivered = (f'{row["received"]}/{row["sent"]} ({pdr})'
+                             if row['received'] is not None else 'no report')
+                log.info(f'  {row["payload_size"]:>4} B  {row["interval_s"]:>6}s  '
+                         f'{row["offered_Bps"]:>6.0f} B/s  {delivered:<15}  '
+                         f'{row["goodput_Bps"] or "-"} B/s')
+        for size, ramp in self.ramp.items():
+            best = ramp['best']
+            if ramp['failed']:
+                log.error(f'No goodput measured ({size} B messages): nothing arrived')
+                continue
+            if best is None:
+                continue
+            confirmed = (self.overload_steps == 0 or ramp['dropped']
+                         or ramp['beyond'] >= self.overload_steps)
+            if ramp['beyond'] and confirmed:
+                log.info(f'Max goodput ({size} B messages): {best["goodput_Bps"]} B/s '
+                         f'= {best["delivered_msg_s"]} msg/s, reached at {best["interval_s"]}s '
+                         'intervals; faster sending only loses more messages')
+            elif ramp['beyond']:
+                log.info(f'Goodput ({size} B messages) levelled off at the top of the ramp: '
+                         f'{best["goodput_Bps"]} B/s = {best["delivered_msg_s"]} msg/s, but only '
+                         f'{ramp["beyond"]} of {self.overload_steps} steps past it fit in the '
+                         f'ramp. {self.raise_hint(size)} to confirm the limit')
+            else:
+                log.info(f'Goodput ({size} B messages) still rising at the fastest step: '
+                         f'{best["goodput_Bps"]} B/s. The limit is above what the ramp offers; '
+                         f'{self.raise_hint(size)[0].lower()}{self.raise_hint(size)[1:]}')
+        if self.summary_path:
+            log.info(f'Summary in {self.summary_path}')
 
 
 def main(args=None):

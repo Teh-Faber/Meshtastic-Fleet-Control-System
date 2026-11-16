@@ -1,20 +1,45 @@
 """
 Launch the Meshtastic bridge.
 
-Launch arguments override the values in the config file.
+Launch arguments override the values in the config file. The message size
+limits (max_payload_bytes, max_fragments) only do so when given.
 
 Run with:
   ros2 launch meshtastic_bridge bridge.launch.py device_name:=drone1 rx_enabled:=false
+  ros2 launch meshtastic_bridge bridge.launch.py max_payload_bytes:=200 max_fragments:=8
 """
 
 import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
-from launch_ros.parameter_descriptions import ParameterValue
+
+# Settings that override the config only when given (name -> conversion).
+OPTIONAL_OVERRIDES = {'max_payload_bytes': int, 'max_fragments': int,
+                      'direct_only': lambda v: v.lower() == 'true'}
+
+
+def bridge_node(context):
+    overrides = {
+        'serial_port': LaunchConfiguration('serial_port').perform(context),
+        'device_name': LaunchConfiguration('device_name').perform(context),
+        'tx_enabled': LaunchConfiguration('tx_enabled').perform(context).lower() == 'true',
+        'rx_enabled': LaunchConfiguration('rx_enabled').perform(context).lower() == 'true',
+    }
+    for name, cast in OPTIONAL_OVERRIDES.items():
+        value = LaunchConfiguration(name).perform(context).strip("'\" ")
+        if value:
+            overrides[name] = cast(value)
+    return [Node(
+        package='meshtastic_bridge',
+        executable='meshtastic_bridge_node',
+        name='meshtastic_bridge_node',
+        parameters=[LaunchConfiguration('config').perform(context), overrides],
+        output='screen',
+    )]
 
 
 def generate_launch_description():
@@ -32,23 +57,14 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'rx_enabled', default_value='true',
             description='Publish topics received from other devices. false = transmit only'),
-        Node(
-            package='meshtastic_bridge',
-            executable='meshtastic_bridge_node',
-            name='meshtastic_bridge_node',
-            parameters=[
-                LaunchConfiguration('config'),
-                {
-                    'serial_port': ParameterValue(
-                        LaunchConfiguration('serial_port'), value_type=str),
-                    'device_name': ParameterValue(
-                        LaunchConfiguration('device_name'), value_type=str),
-                    'tx_enabled': ParameterValue(
-                        LaunchConfiguration('tx_enabled'), value_type=bool),
-                    'rx_enabled': ParameterValue(
-                        LaunchConfiguration('rx_enabled'), value_type=bool),
-                },
-            ],
-            output='screen',
-        ),
+        DeclareLaunchArgument(
+            'max_payload_bytes', default_value='',
+            description='Bridge bytes per LoRa packet. Empty: from the config (221)'),
+        DeclareLaunchArgument(
+            'max_fragments', default_value='',
+            description='Most packets per message. Empty: from the config (4)'),
+        DeclareLaunchArgument(
+            'direct_only', default_value='',
+            description='true: send with hop limit 0, nobody relays. Empty: from the config'),
+        OpaqueFunction(function=bridge_node),
     ])

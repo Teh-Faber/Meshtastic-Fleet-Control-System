@@ -38,9 +38,17 @@ meshtastic_bridge_node:
     dest: "^all"
     channel_index: 0
     hop_limit: 0
+    # false: packets may be relayed by other radios, as in normal mesh use,
+    # so tests through a relay node work and report their hop count.
+    # true: send with hop limit 0, nobody relays. For a direct-link benchmark
+    # between two radios this saves the airtime of every rebroadcast (at 1 m
+    # on SHORT_FAST losses fell from 15 % to 3.5 %), but a relay in between
+    # can't forward anything. Override per run with direct_only:=true.
+    direct_only: false
     port_num: PRIVATE_APP
-    max_payload_bytes: 233
+    max_payload_bytes: 221
     poll_hz: 20.0
+    reconnect_period_s: 5.0
     # The link tests log the GPS positions of both ends (T-Beam boards) and
     # the distance between them. Boards without GPS simply report none.
     gps_topic: /mesh/gps/fix

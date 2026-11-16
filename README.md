@@ -174,22 +174,27 @@ Start the echo device on the remote (moving) device once, then run tests from th
 scripts/run_test.sh echo
 
 # Host
-scripts/run_test.sh latency    label:=500m
-scripts/run_test.sh throughput label:=500m payload_size:=200 interval_s:=2.0
-scripts/sweep_throughput.sh 30 label:=500m          # several sizes and intervals
+scripts/run_test.sh latency    label:=500m      # ~30 s
+scripts/run_test.sh throughput label:=500m                   # ramp up to 800 B/s, ~1.5-2 min
+scripts/run_test.sh throughput label:=500m max_rate_Bps:=400  # ramp up to 400 B/s
+scripts/run_test.sh throughput label:=500m payload_size:=800  # 800 B messages (4 packets each)
+scripts/sweep_throughput.sh    label:=500m                   # 3 sizes x 6 steps, ~4 min
 
 # Show results
 python3 scripts/analyze_results.py
 ```
 
-To measure range, move the remote device to each position and run the tests there with a new `label`. RSSI, SNR and hop count are recorded automatically. Results are written to `~/fleet_test_results/`.
+The durations are for `SHORT_FAST` and include the bridge start and the handshake (a few seconds). The throughput test raises the offered data rate in `ramp_steps` (default 6) even steps up to `max_rate_Bps` (default 800 B/s), at most `max_packet_rate` (default 4) radio packets per second. `payload_size` (default 200 B) sets the message size: up to 200 B fits one radio packet, and up to 848 B is split into 4 (`max_fragments:=8` allows 1712 B). Sizes that won't fit are refused with the reason. It stops two steps after goodput stops rising and reports the maximum goodput. Set `max_rate_Bps` a little above the rate you expect the link to carry: offering far more doesn't measure anything extra, it only overwhelms the radio. `interval_s:=0.5` runs a single rate instead. The tests log their progress as they go: each ping with its RTT and link quality, sending progress, and one result line per throughput run. The echo device logs which host tests it is answering, and a status line every 30 s while idle.
 
-Long test series run into the 10% duty cycle and then stop transmitting. Give `sweep_throughput.sh` a longer pause, e.g. `PAUSE_S=600 scripts/sweep_throughput.sh ...`.
+To measure range, move the remote device to each position and run the tests there with a new `label`. RSSI, SNR and hop count are recorded automatically, and so is the distance when both ends are T-Beams with a GPS fix. Results are written to `results/` in the workspace (`~/fleet_ws/results/`), or to `output_dir:=...` / `$FLEET_RESULTS_DIR` if set.
+
+Long test series run into the 10% duty cycle and then stop transmitting. Runs past the limit keep the radio transmitting for their whole duration, so on `SHORT_FAST` budget for about two sweeps or five throughput ramps per hour. When the budget is used up, the bridge logs `Radio refused N packet(s): DUTY_CYCLE_LIMIT` and the radio's own notice saying when it can send again. On `LONG_FAST`, ramp to a much lower rate, e.g. `MAX_RATE=100 SIZES=200 scripts/sweep_throughput.sh`, and leave time between sweeps.
 
 ## Troubleshooting
 
 | Symptom | Fix |
 |---|---|
+| Communication stops after a while; the bridge logs `Lost connection to the Meshtastic device` | The radio dropped off USB, usually a power problem: on a Pi, `journalctl -k \| grep -i undervoltage` shows it. Use a proper supply (Pi 4: 5.1 V 3 A) or a powered USB hub, or put a charged 18650 in the T-Beam to buffer its transmit current. The bridge reconnects by itself every `reconnect_period_s` |
 | `Could not connect ...` and the connection **times out** | The board isn't running Meshtastic. Flash it ([step 2](#2-flash-meshtastic-onto-the-board)) |
 | `Could not connect ...` / permission denied | `sudo usermod -a -G dialout $USER`, then log out and in. Close the `meshtastic` CLI and serial monitors |
 | `No Meshtastic device found` / `Several possible devices found` | Plug the board in, or set `serial_port` (e.g. `/dev/ttyACM0`) |

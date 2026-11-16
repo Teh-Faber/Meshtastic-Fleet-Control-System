@@ -27,11 +27,16 @@ KIND_ANNOUNCE = 1
 KIND_DATA = 2
 KIND_REQUEST = 3
 
-# TODO: verify against the firmware version in use (DATA_PAYLOAD_LEN).
-MAX_PAYLOAD_BYTES = 233
+# Largest bridge packet known to arrive. Meshtastic's DATA_PAYLOAD_LEN is 233,
+# but with PRIVATE_APP (3-byte port number) the firmware (2.7.26) rejects
+# 233 B as TOO_LARGE. It accepts 231 B, yet 231 B packets never reached the
+# other T-Beam, while 221 B ones did (link test, SHORT_FAST). The exact limit
+# lies between 221 and 231 B.
+MAX_PAYLOAD_BYTES = 221
 MAX_FRAGMENTS = 16
 
 _KIND = struct.Struct('<B')
+_TID = struct.Struct('<H')
 # kind byte, topic id, message seq, fragment (index << 4 | count - 1)
 _DATA = struct.Struct('<BHBB')
 # kind byte, topic id, then device name, topic and type as length-prefixed strings
@@ -73,9 +78,17 @@ def encode_announce(tid, device_name, topic, msg_type):
     return payload
 
 
-def encode_request():
-    """Encode a REQUEST packet asking for a re-announce."""
-    return _KIND.pack(_kind_byte(KIND_REQUEST))
+def encode_request(tid=None):
+    """
+    Encode a REQUEST packet asking for a re-announce.
+
+    With ``tid`` it asks for that topic only. Bridges that predate this read
+    only the kind byte and announce all their topics, which still works.
+    """
+    payload = _KIND.pack(_kind_byte(KIND_REQUEST))
+    if tid is not None:
+        payload += _TID.pack(tid)
+    return payload
 
 
 def encode_data(tid, msg_seq, serialized, max_payload=MAX_PAYLOAD_BYTES,
@@ -122,7 +135,9 @@ def decode(payload):
                 'msg_type': msg_type,
             }
         if kind == KIND_REQUEST:
-            return kind, {}
+            tid = _TID.unpack_from(payload, _KIND.size)[0] \
+                if len(payload) >= _KIND.size + _TID.size else None
+            return kind, {'topic_id': tid}
     except (struct.error, IndexError) as e:
         raise ValueError(f'truncated packet: {e}') from e
     raise ValueError(f'unknown packet kind {kind}')

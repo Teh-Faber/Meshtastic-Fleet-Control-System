@@ -25,10 +25,15 @@ Meshtastic's serial (or TCP) API. On connect it logs hardware model,
 firmware version and LoRa region, and warns about settings that stop
 the link from working.
 
-TODO: reconnect after the serial link drops, unsubscribe from topics
+If the radio drops off (USB disconnect, power dip, unplugged), the bridge
+retries every ``reconnect_period_s`` and re-announces its topics once the
+radio is back.
+
+TODO: unsubscribe from topics
 that disappear, optional ACKs for selected topics.
 """
 
+import collections
 import fnmatch
 import queue
 import re
@@ -53,6 +58,33 @@ from sensor_msgs.msg import NavSatFix, NavSatStatus
 
 # Assumed GPS user range error (m), used to turn PDOP into a covariance.
 GPS_UERE_M = 5.0
+
+# Log radio refusals and notices at most this often.
+REFUSAL_LOG_PERIOD_S = 10.0
+# Announcements go out at least this far apart. Sent back to back, the last
+# of a burst was regularly lost (the receiving radio was busy, e.g.
+# rebroadcasting the previous packet), so a topic stayed unknown remotely.
+ANNOUNCE_SPACING_S = 0.3
+# Warn when handing one packet to the radio takes longer than this: the
+# Meshtastic library blocks (and with it this whole node) while the radio's
+# transmit queue is full, so nothing is received or published meanwhile.
+SEND_STALL_WARN_S = 5.0
+# Ask a device again for a topic it hasn't announced after this long.
+REQUEST_RETRY_S = 5.0
+# Answer requests for one topic at most this often (several devices may ask).
+ANSWER_REQUEST_S = 2.0
+# Answer requests for all topics (from bridges without topic ids) at most this often.
+ANSWER_REQUEST_ALL_S = 10.0
+# Why the radio refused to send one of our packets (routing error reasons).
+REFUSAL_HINTS = {
+    'DUTY_CYCLE_LIMIT': 'the hourly duty-cycle airtime budget (10 % in EU_868) is used up; '
+                        'the radio sends nothing until it recovers',
+    'RATE_LIMIT_EXCEEDED': 'the firmware is rate limiting packets from this client; '
+                           'send less often',
+    'TOO_LARGE': 'packet too large for the radio; lower max_payload_bytes',
+    'NO_CHANNEL': 'channel_index is not set up on the radio',
+    'NO_INTERFACE': 'the radio has no usable LoRa interface (region unset?)',
+}
 
 
 def sanitize_name(name):
@@ -179,9 +211,11 @@ class BridgeNode(Node):
         self.declare_parameter('dest', '^all')
         self.declare_parameter('channel_index', 0)
         self.declare_parameter('hop_limit', 0)
+        self.declare_parameter('direct_only', False)
         self.declare_parameter('port_num', 'PRIVATE_APP')
-        self.declare_parameter('max_payload_bytes', 233)
+        self.declare_parameter('max_payload_bytes', codec.MAX_PAYLOAD_BYTES)
         self.declare_parameter('poll_hz', 20.0)
+        self.declare_parameter('reconnect_period_s', 5.0)
         self.declare_parameter('gps_topic', '')
 
         self.serial_port = self.param('serial_port')
@@ -207,6 +241,8 @@ class BridgeNode(Node):
         self.dest = self.param('dest')
         self.channel_index = self.param('channel_index')
         self.hop_limit = self.param('hop_limit')
+        # Send with hop limit 0: nobody relays (rebroadcasts) our packets.
+        self.direct_only = self.param('direct_only')
         self.port_name = self.param('port_num')
         self.port_num = portnums_pb2.PortNum.Value(self.port_name)
         self.max_payload_bytes = self.param('max_payload_bytes')
@@ -216,8 +252,11 @@ class BridgeNode(Node):
         self.device_names = {}    # sender id -> device name
         self.own_topics = set()   # topics this node publishes; never sent back out
         self.unsupported = set()  # local topics whose type could not be loaded
-        self.last_request = {}    # sender id -> time we last asked it to announce
+        self.last_request = {}    # (sender id, topic id) -> time we last asked for it
         self.last_announce_all = 0.0
+        self.announce_queue = {}  # local topic name -> TxTopic, sent ANNOUNCE_SPACING_S apart
+        self.last_announce_sent = 0.0
+        self.last_answer = {}     # topic id -> time we last answered a request for it
         self.reassembler = codec.Reassembler()
 
         # Best effort matches both reliable and best-effort publishers. Depth 1
@@ -228,12 +267,21 @@ class BridgeNode(Node):
         # They only push onto this queue; poll() drains it on the executor.
         self._inbox = queue.Queue()
         self.interface = None
+        self.reconnect_period_s = self.param('reconnect_period_s')
+        self.reconnect_at = 0.0     # next reconnect attempt while disconnected
+        self.reconnect_attempts = 0
+        self.last_reconnect_log = 0.0
         self.my_node_num = None
         self.gps_pub = None
         self.last_fix_key = None
+        self.refusals = collections.Counter()  # routing error -> packets since last log
+        self.last_refusal_log = 0.0
+        self.last_notices = {}  # notice text -> time last logged
         pub.subscribe(self._on_receive, 'meshtastic.receive')
         pub.subscribe(self._on_connection_lost, 'meshtastic.connection.lost')
-        self.connect()
+        pub.subscribe(self._on_client_notification, 'meshtastic.clientNotification')
+        if not self.connect():
+            self.reconnect_at = time.monotonic() + self.reconnect_period_s
         self.device_name = self.resolve_device_name(self.param('device_name'))
 
         if self.rx_enabled:
@@ -285,7 +333,7 @@ class BridgeNode(Node):
 
     # --- Meshtastic connection -------------------------------------------
 
-    def find_serial_port(self):
+    def find_serial_port(self, quiet=False):
         """Return the configured port, or the single Meshtastic-capable port found."""
         if self.serial_port not in ('', 'auto'):
             return self.serial_port
@@ -295,6 +343,8 @@ class BridgeNode(Node):
         if len(ports) == 1:
             self.get_logger().info(f'Auto-detected Meshtastic device on {ports[0]}')
             return ports[0]
+        if quiet:
+            return None
         if not ports:
             self.get_logger().error('No Meshtastic device found. Is the board plugged in?')
         else:
@@ -302,10 +352,10 @@ class BridgeNode(Node):
                 f'Several possible devices found ({", ".join(ports)}); set serial_port')
         return None
 
-    def open_interface(self):
+    def open_interface(self, quiet=False):
         if self.tcp_host:
             return meshtastic.tcp_interface.TCPInterface(hostname=self.tcp_host)
-        port = self.find_serial_port()
+        port = self.find_serial_port(quiet)
         if port is None:
             return None
         try:
@@ -315,23 +365,27 @@ class BridgeNode(Node):
             # Older meshtastic releases have no timeout argument (fixed 300 s).
             return meshtastic.serial_interface.SerialInterface(devPath=port)
 
-    def connect(self):
-        """Connect to the Meshtastic device over TCP or serial and check its setup."""
+    def connect(self, quiet=False):
+        """
+        Connect to the Meshtastic device over TCP or serial and check its setup.
+
+        Returns True if connected. ``quiet`` skips the error log (reconnect attempts).
+        """
         target = self.tcp_host or self.serial_port
         try:
-            self.interface = self.open_interface()
+            self.interface = self.open_interface(quiet)
         except Exception as e:
-            # A board that opens but never answers is most likely not running
-            # Meshtastic, e.g. still on LilyGo's factory test image.
-            self.get_logger().error(
-                f'Could not connect to a Meshtastic device on {target}: {e}. If the port opens '
-                'but times out, the board is probably not running Meshtastic firmware; '
-                'flash "Tlora T3s3 V1" from https://flasher.meshtastic.org')
-            # TODO: retry on a timer instead of staying disconnected.
+            if not quiet:
+                # A board that opens but never answers is most likely not running
+                # Meshtastic, e.g. still on LilyGo's factory test image.
+                self.get_logger().error(
+                    f'Could not connect to a Meshtastic device on {target}: {e}. If the port '
+                    'opens but times out, the board is probably not running Meshtastic '
+                    'firmware; flash it from https://flasher.meshtastic.org')
             self.interface = None
-            return
+            return False
         if self.interface is None:
-            return
+            return False
         lora = self.check_device()
         if lora is not None and self.apply_radio_settings(lora):
             # Writing the LoRa config reboots the device; reconnect once it is back.
@@ -346,8 +400,36 @@ class BridgeNode(Node):
                 self.get_logger().error(f'Could not reconnect after applying LoRa settings: {e}')
                 self.interface = None
                 return
-            if self.interface is not None:
-                self.check_device()
+            if self.interface is None:
+                return False
+            self.check_device()
+        return True
+
+    def try_reconnect(self):
+        """Reconnect to the radio after it dropped off; called from poll() while disconnected."""
+        now = time.monotonic()
+        self.reconnect_attempts += 1
+        if self.connect(quiet=True):
+            self.get_logger().warn(
+                f'Reconnected to the Meshtastic device after {self.reconnect_attempts} '
+                'attempt(s); re-announcing topics')
+            self.reconnect_attempts = 0
+            if not self.param('device_name') and not self.device_name.startswith('node_'):
+                # Started without a radio, so the name fell back to the hostname.
+                # Nothing could be sent under it, so switch to the radio's name.
+                self.device_name = self.resolve_device_name('')
+                self.get_logger().info(f'Bridging as "{self.device_name}" from now on')
+            if self.device_name:
+                self.announce_all()
+            if self.gps_pub is not None:
+                self.publish_own_position()
+            return
+        self.reconnect_at = time.monotonic() + self.reconnect_period_s
+        if now - self.last_reconnect_log >= 60.0:
+            self.last_reconnect_log = now
+            self.get_logger().warn(
+                f'Still no Meshtastic device ({self.reconnect_attempts} attempt(s)); retrying '
+                f'every {self.reconnect_period_s:g}s. Is the board plugged in and powered?')
 
     def apply_radio_settings(self, lora):
         """Write ``lora_region``/``modem_preset`` to the device if they differ. True if written."""
@@ -435,16 +517,24 @@ class BridgeNode(Node):
         if self.interface is None:
             self.get_logger().warn('Not connected, dropping packet', throttle_duration_sec=5.0)
             return
+        t_start = time.monotonic()
         try:
             self.interface.sendData(
                 payload,
                 destinationId=dest or self.dest,
                 portNum=self.port_num,
                 channelIndex=self.channel_index,
-                hopLimit=self.hop_limit or None,
+                hopLimit=0 if self.direct_only else (self.hop_limit or None),
             )
         except Exception as e:
             self.get_logger().error(f'sendData failed: {e}', throttle_duration_sec=5.0)
+        blocked = time.monotonic() - t_start
+        if blocked > SEND_STALL_WARN_S:
+            self.get_logger().warn(
+                f'Sending one packet blocked for {blocked:.0f}s waiting for the radio\'s '
+                'transmit queue; nothing was received or published meanwhile. The radio may '
+                'be over its duty cycle, busy, or hung (power-cycle it if this repeats)',
+                throttle_duration_sec=30.0)
 
     def _on_receive(self, packet, interface):
         portnum = packet.get('decoded', {}).get('portnum')
@@ -454,9 +544,18 @@ class BridgeNode(Node):
               and packet.get('from') == self.my_node_num):
             # Our own position, sent by the firmware to the API client.
             self._inbox.put(('pos', packet['decoded'].get('position', {})))
+        elif portnum == 'ROUTING_APP':
+            # The firmware NAKs a packet it won't send (duty cycle, too large...).
+            reason = packet['decoded'].get('routing', {}).get('errorReason')
+            if reason and reason != 'NONE' and packet['decoded'].get('requestId'):
+                self._inbox.put(('refused', reason))
+
+    def _on_client_notification(self, notification, interface):
+        # e.g. "Duty cycle limit exceeded. You can send again in 12 mins"
+        self._inbox.put(('notice', getattr(notification, 'message', str(notification))))
 
     def _on_connection_lost(self, interface):
-        self._inbox.put(('lost', None))
+        self._inbox.put(('lost', interface))
 
     # --- TX: local topics -> mesh ----------------------------------------
 
@@ -515,13 +614,41 @@ class BridgeNode(Node):
             self.send(packet)
 
     def announce(self, topic):
-        self.send(codec.encode_announce(
-            topic.topic_id, self.device_name, topic.name, topic.msg_type))
+        """Queue an announcement; send_announcements() spaces them out."""
+        self.announce_queue[topic.name] = topic
 
     def announce_all(self):
         self.last_announce_all = time.monotonic()
         for topic in self.tx_topics.values():
             self.announce(topic)
+
+    def send_announcements(self):
+        now = time.monotonic()
+        if not self.announce_queue or now - self.last_announce_sent < ANNOUNCE_SPACING_S:
+            return
+        name = next(iter(self.announce_queue))
+        topic = self.announce_queue.pop(name)
+        self.last_announce_sent = now
+        self.send(codec.encode_announce(
+            topic.topic_id, self.device_name, topic.name, topic.msg_type))
+
+    def answer_request(self, fields):
+        """Re-announce the topic a device asked for, or all topics if it didn't say."""
+        if not self.tx_enabled:
+            return
+        now = time.monotonic()
+        tid = fields.get('topic_id')
+        if tid is None:
+            # A bridge without topic ids in requests; several may ask at once.
+            if now - self.last_announce_all > ANSWER_REQUEST_ALL_S:
+                self.announce_all()
+            return
+        if now - self.last_answer.get(tid, 0.0) < ANSWER_REQUEST_S:
+            return
+        for topic in self.tx_topics.values():
+            if topic.topic_id == tid:
+                self.last_answer[tid] = now
+                self.announce(topic)
 
     # --- GPS: the radio's own position -------------------------------------
 
@@ -564,16 +691,70 @@ class BridgeNode(Node):
                 self.handle_packet(packet)
             elif kind == 'pos':
                 self.publish_position(packet)
+            elif kind == 'refused':
+                self.refusals[packet] += 1
+            elif kind == 'notice':
+                self.log_notice(packet)
             elif kind == 'lost':
-                self.get_logger().error('Lost connection to Meshtastic device')
-                self.interface = None
-                # TODO: schedule reconnect.
+                self.handle_connection_lost(packet)
+        if self.interface is None and self.reconnect_at and time.monotonic() >= self.reconnect_at:
+            self.try_reconnect()
+        self.log_refusals()
+        self.send_announcements()
         for topic in self.tx_topics.values():
             self.send_if_due(topic)
         self.reassembler.expire()
 
+    def handle_connection_lost(self, interface):
+        if interface is not None and interface is not self.interface:
+            return  # an interface we already replaced
+        self.get_logger().error(
+            'Lost connection to the Meshtastic device (USB disconnect or power dip?); '
+            f'reconnecting every {self.reconnect_period_s:g}s')
+        if self.interface is not None:
+            try:
+                self.interface.close()
+            except Exception:
+                pass
+        self.interface = None
+        self.reconnect_attempts = 0
+        self.last_reconnect_log = time.monotonic()
+        self.reconnect_at = time.monotonic() + self.reconnect_period_s
+
+    def log_refusals(self):
+        """Summarize packets the radio refused to send, at most every REFUSAL_LOG_PERIOD_S."""
+        now = time.monotonic()
+        if not self.refusals or now - self.last_refusal_log < REFUSAL_LOG_PERIOD_S:
+            return
+        self.last_refusal_log = now
+        for reason, count in self.refusals.items():
+            hint = REFUSAL_HINTS.get(reason, 'see the Meshtastic routing error codes')
+            self.get_logger().warn(f'Radio refused {count} packet(s): {reason} ({hint})')
+        self.refusals.clear()
+
+    def log_notice(self, text):
+        now = time.monotonic()
+        if now - self.last_notices.get(text, 0.0) >= REFUSAL_LOG_PERIOD_S * 3:
+            self.last_notices[text] = now
+            self.get_logger().warn(f'Radio: {text}')
+
+    @staticmethod
+    def sender_id(packet):
+        """
+        Return the sender's node id (``!a1b2c3d4``) of a received packet.
+
+        The library's ``fromId`` is None while the radio doesn't know the node
+        yet (after a radio reboot or reconnect, until its node info arrives),
+        so build it from the numeric ``from``, which is always there.
+        """
+        if packet.get('fromId'):
+            return packet['fromId']
+        if packet.get('from') is not None:
+            return f'!{packet["from"]:08x}'
+        return None
+
     def handle_packet(self, packet):
-        sender = packet.get('fromId')
+        sender = self.sender_id(packet)
         try:
             kind, fields = codec.decode(packet.get('decoded', {}).get('payload', b''))
         except ValueError as e:
@@ -583,9 +764,7 @@ class BridgeNode(Node):
             return
 
         if kind == codec.KIND_REQUEST:
-            # Several devices may ask at once; answer at most every 10 s.
-            if self.tx_enabled and time.monotonic() - self.last_announce_all > 10.0:
-                self.announce_all()
+            self.answer_request(fields)
         elif not self.rx_enabled:
             return
         elif kind == codec.KIND_ANNOUNCE:
@@ -645,7 +824,7 @@ class BridgeNode(Node):
     def handle_data(self, sender, fields, packet):
         remote = self.remote_topics.get((sender, fields['topic_id']))
         if remote is None:
-            self.request_announce(sender)
+            self.request_announce(sender, fields['topic_id'])
             return
         serialized = self.reassembler.add(sender, fields)
         if serialized is None or remote.publisher is None:
@@ -658,16 +837,26 @@ class BridgeNode(Node):
         self.publish_link_quality(sender, remote, fields['msg_seq'], packet)
         remote.publisher.publish(msg)
 
-    def request_announce(self, sender):
+    def request_announce(self, sender, tid):
+        """Ask ``sender`` to announce topic ``tid``, whose data arrived unannounced."""
         now = time.monotonic()
-        if now - self.last_request.get(sender, 0.0) > 30.0:
-            self.last_request[sender] = now
-            self.send(codec.encode_request(), dest=sender)
+        if now - self.last_request.get((sender, tid), 0.0) >= REQUEST_RETRY_S:
+            self.last_request[(sender, tid)] = now
+            self.get_logger().info(
+                f'Data for unknown topic {tid:#06x} from {sender}, asking it to announce')
+            self.send(codec.encode_request(tid), dest=sender)
 
     def publish_link_quality(self, sender, remote, msg_seq, packet):
-        # protobuf omits zero-valued fields, so hopStart may be missing.
+        # protobuf omits zero-valued fields: both missing means a packet sent
+        # with hop limit 0 (direct only), i.e. 0 hops. Only hopStart missing
+        # means firmware too old to report it: unknown.
         hop_start, hop_limit = packet.get('hopStart'), packet.get('hopLimit')
-        hops = '' if hop_start is None or hop_limit is None else str(hop_start - hop_limit)
+        if hop_start is None and hop_limit is None:
+            hops = '0'
+        elif hop_start is None:
+            hops = ''
+        else:
+            hops = str(hop_start - (hop_limit or 0))
         values = {
             'topic': remote.local_name,
             'source_topic': remote.source_topic,

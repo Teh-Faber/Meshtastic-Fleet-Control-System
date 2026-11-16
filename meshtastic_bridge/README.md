@@ -139,7 +139,7 @@ Size the bridge settings so that, on each device, the sum over all bridged topic
 
 ## Parameters
 
-Defaults as in [`config/meshtastic_bridge_node.yaml`](../config/meshtastic_bridge_node.yaml). The `serial_port`, `device_name`, `tx_enabled` and `rx_enabled` launch arguments of `bridge.launch.py` override the values in the config file.
+Defaults as in [`config/meshtastic_bridge_node.yaml`](../config/meshtastic_bridge_node.yaml). The `serial_port`, `device_name`, `tx_enabled` and `rx_enabled` launch arguments of `bridge.launch.py` override the values in the config file. `max_payload_bytes` and `max_fragments` do so only when given, and the test launch files pass them through.
 
 | Parameter | Default | Description |
 |---|---|---|
@@ -162,7 +162,7 @@ Defaults as in [`config/meshtastic_bridge_node.yaml`](../config/meshtastic_bridg
 | `rx_exclude_topics` | unset | Never republish these received topics |
 | `min_interval_s` | `60.0` | Minimum time between two messages of the same topic. See [duty cycle](#rate-limiting-and-duty-cycle-eu868) |
 | `topic_intervals` | `["/gps/fix=30.0", "/battery_state=120.0"]` | Per-topic intervals as `"pattern=seconds"`. The first match wins |
-| `max_fragments` | `4` | Messages that need more LoRa packets than this are not sent |
+| `max_fragments` | `4` | Messages that need more LoRa packets than this are not sent (at most 16). With 221 B packets, 4 allows 864 B serialized messages |
 | `scan_period_s` | `5.0` | How often the ROS graph is scanned for new topics |
 | `announce_period_s` | `300.0` | How often topic announcements are repeated |
 | `remote_namespace` | `mesh` | Prefix for received topics: `/<remote_namespace>/<device>/<topic>` |
@@ -170,9 +170,11 @@ Defaults as in [`config/meshtastic_bridge_node.yaml`](../config/meshtastic_bridg
 | `dest` | `^all` | Meshtastic destination. `^all` broadcasts; a node id (`"!a1b2c3d4"`) unicasts |
 | `channel_index` | `0` | Meshtastic channel |
 | `hop_limit` | `0` | Max relay hops. `0` uses the firmware default |
+| `direct_only` | `false` | Send with hop limit 0, so no radio relays the bridge's packets. On a direct link this avoids the rebroadcast of every packet, which costs airtime and blocks the receiver (`false` in both configs; pass `direct_only:=true` for a direct-link benchmark) |
 | `port_num` | `PRIVATE_APP` | Meshtastic port number used by the bridge |
-| `max_payload_bytes` | `233` | LoRa payload size per packet |
+| `max_payload_bytes` | `221` | Bridge bytes per LoRa packet. Larger messages are split into fragments. 233 (Meshtastic's nominal maximum) is rejected by the firmware on `PRIVATE_APP`, and 231 B packets didn't arrive in the link tests; 221 B is the largest size verified |
 | `poll_hz` | `20.0` | How often received packets are processed and due messages sent |
+| `reconnect_period_s` | `5.0` | If the radio drops off (USB disconnect, power dip) or isn't there at start-up, retry this often. Topics are re-announced once it's back |
 | `gps_topic` | `""` | Publish the radio's own GPS fix here as `sensor_msgs/NavSatFix` (boards with GPS, e.g. T-Beam). `""` disables it |
 
 ## Topics
@@ -183,6 +185,10 @@ Defaults as in [`config/meshtastic_bridge_node.yaml`](../config/meshtastic_bridg
 | `/mesh/link_quality` | `diagnostic_msgs/DiagnosticStatus` | One message per received message. `name` is the device; `values` hold `topic`, `source_topic`, `msg_seq`, `rssi`, `snr` and `hops` |
 
 `hops` is the number of relays a message passed through (`0` = direct).
+
+**Announcements.** Each bridge announces the topics it sends (name, type, device), so the receiver can republish them. Announcements go out at least 0.3 s apart: sent back to back, the last one of a burst was regularly lost. When data arrives for a topic that hasn't been announced, the receiver asks the sender for that topic, and repeats every 5 s until it arrives. The sender re-announces only that topic. Bridges from before this change ignore the topic in the request and re-announce all their topics, at most every 10 s.
+
+**Radio refusals.** When the firmware won't send a packet, it reports this to the bridge, and the bridge logs a warning at most every 10 s, e.g. `Radio refused 12 packet(s): DUTY_CYCLE_LIMIT (...)`. Reasons include `DUTY_CYCLE_LIMIT` (hourly airtime budget used up), `RATE_LIMIT_EXCEEDED`, `TOO_LARGE` and `NO_CHANNEL`. The radio's own notices, such as "Duty cycle limit exceeded. You can send again in 12 mins", are logged as `Radio: ...`.
 
 **GPS.** With `gps_topic` set, the bridge publishes the radio's own GPS fix there. Only the position the firmware sends to the API client at full precision is used. Copies of the radio's mesh position broadcasts are cut down to the channel's precision (13 bits ≈ 3 km here) and are ignored. The bridge never writes a position to the radio: a position packet sent to your own node replaces the node's position. `header.stamp` is the GPS fix time. `altitude` is above mean sea level, not above the WGS84 ellipsoid as `NavSatFix` specifies. The covariance is estimated from PDOP with an assumed 5 m user range error. The fix needs a clear view of the sky. Indoors a T-Beam usually has none, and nothing is published.
 
@@ -204,25 +210,41 @@ The tests are ROS nodes in `scripts/tests/` that only publish and subscribe to o
 | `/link_test/report_request` → `/<echo>/link_test/report` | `std_msgs/String` | host → echo → host | Throughput: the echo device's counts (JSON) for one run, with its GPS position |
 | `/<echo>/link_test/position` | `sensor_msgs/NavSatFix` | echo → host | The echo device's GPS fix, every `position_period_s` (default 60 s), only while it has one |
 
-**Handshake.** Every host test first sends unnumbered pings every 2 s until the echo device answers (`handshake_timeout_s`, default 120 s). That gives both bridges time to discover each other's topics, so start-up losses don't count against the measurement.
+**Handshake.** Every host test first sends unnumbered pings every 2 s until the echo device answers (`handshake_timeout_s`, default 60 s). That gives both bridges time to discover each other's topics, so start-up losses don't count against the measurement. Every 10 s it logs how far it got: no pong topic from another device yet (the echo device isn't running or isn't heard), or pong topic found but no answer yet.
 
-**Latency.** RTT is measured on the host's clock, so the devices' clocks don't need to be synced. Link quality is that of the pongs (echo → host).
+**Latency.** One ping is in flight at a time. The next one goes out as soon as the previous one is answered or times out (`timeout_s`, default 10 s), but never sooner than `interval_s` (default 1 s) after the previous ping. A run of `count` pings (default 20) therefore takes about `count` × RTT. Pings never queue up in the radio behind each other, which would add queueing delay to the RTT. RTT is measured on the host's clock, so the devices' clocks don't need to be synced. Link quality is that of the pongs (echo → host). Each ping is logged with its RTT, RSSI, SNR, hops and the expected time left.
 
-**Throughput.** The host sends `count` messages, then repeats a report request until the echo device answers (`report_timeout_s`). Goodput is the bytes received divided by the time between the first and last message received, measured on the echo device. Link quality is measured by the echo device (host → echo). The bridge keeps only the latest message per topic, so anything published faster than the radio can send is overwritten and counts as lost.
+**Throughput.** A run sends `payload_size`-byte messages (default 200 B, the largest that fits in one 221 B bridge packet; see **Message size** below) every interval for `duration_s` (default 10 s; `count` > 0 sends a fixed number instead). It then repeats a report request until the echo device answers (`report_timeout_s`, default 30 s). By default (`interval_s:=0`) the test **ramps**: it offers `ramp_steps` (default 6) evenly spaced data rates up to `max_rate_Bps` (default 800 B/s). For 200 B messages that's 133, 267, … 800 B/s, i.e. one message every 1.5 s down to every 0.25 s. Two T-Beams on `SHORT_FAST` at 1 m carry about 550–580 B/s (2.7–2.9 msg/s) direct-only, so the top steps go past the limit. `max_packet_rate` (default 4 packets/s) caps the top step in radio packets, so neither small messages nor messages split into several packets flood the radio: for 16 B messages the top step is 64 B/s, and for 800 B messages (4 packets each) 800 B/s. Once goodput stops rising by more than 5%, it does `overload_steps` (default 2) more steps to show the overload, then stops and logs the maximum goodput (`overload_steps:=0` runs every step). Choose `max_rate_Bps` a little above what you expect the link to carry. Offering far more doesn't measure anything extra: the radio's queue overflows, the bridge blocks waiting for it, and the radio is overwhelmed. Above ~10 packets/s the test warns, because the Meshtastic Python library can't hand more than that to the radio. If nothing arrives before any step has succeeded, it stops with an error instead: a faster rate can't help, so the echo device, the range or the message size is the problem. On a T-Beam the limit is the number of packets per second, not airtime. Its 16-packet transmit queue drains at only a few packets per second, and the Meshtastic Python library sleeps 0.1 s after every write and polls for free queue slots every 0.5 s. Small messages therefore saturate at about the same message rate as large ones, at a much lower goodput. `interval_s:=0.5` runs a single rate. Runs last seconds, not a fixed number of messages, because the radio buffers about 16 packets. A short burst is absorbed by that queue and still arrives in full, hiding the limit. A 10 s run at a fast rate overflows it. Once the radio's queue is full, the bridge waits for a free slot, and messages published meanwhile are overwritten and count as lost. Goodput is the bytes received after the first message, divided by the time between the first and last message received, measured on the echo device. Leaving out the first message's bytes keeps short runs from overstating it: the span covers only *n*−1 intervals. Link quality is measured by the echo device (host → echo). The bridge keeps only the latest message per topic, so anything published faster than the radio can send is overwritten and counts as lost.
+
+**Message size.** `payload_size` (or `payload_sizes` for several) is the size of the test messages. It is limited by the bridge: `max_payload_bytes` per radio packet (221 B) and `max_fragments` packets per message (4). Both can be set for a test run, e.g. `run_test.sh throughput payload_size:=1600 max_fragments:=8`; the launch files pass them to the bridge. During the handshake the test reads the running bridge's actual limits from its parameters. It then works out with the bridge's own codec how many packets each message takes:
+
+| Test payload | Packets (defaults) |
+|---|---|
+| up to 200 B | 1 |
+| 201–416 B | 2 |
+| 417–632 B | 3 |
+| 633–848 B | 4 |
+| over 848 B | refused (raise `max_fragments`, at most 16 = 3440 B) |
+
+Sizes that won't fit are refused with the reason before the run, instead of silently never arriving. Each packet of a split message is sent separately, so a message is lost if any of its packets is, and the rate cap counts packets, not messages. The summary rows hold `packets_per_msg` and `offered_packets_s`.
+
+**Sweeps.** With `payload_sizes` and `intervals` (comma separated) one throughput process runs every combination one after the other, `pause_s` (default 2 s) apart, over the same bridge connection, without stopping early. The bridge start and the handshake happen once, not once per combination. Each run has its own run id and its own summary row (`status`: `ok`, `no_report`, or `interrupted` on Ctrl+C). A run without a report doesn't stop the sweep. `scripts/sweep_throughput.sh` ramps several sizes (default 16, 64, 200 B) with the same `max_rate_Bps`/`ramp_steps`/`max_packet_rate` (env `MAX_RATE`, `STEPS`, `MAX_PACKET_RATE`), running every step for a complete curve: 3 × 6 runs of 10 s, ~4–5 min on `SHORT_FAST`. With `payload_sizes` and `intervals` given directly, the throughput test runs that fixed grid instead. The summary rows also hold `mode` (ramp, single or sweep) and `delivered_msg_s`.
+
+**Relaying.** By default test packets may be relayed, like all mesh traffic, so tests through a relay node work and `hops` shows how many relays a message passed. Meshtastic floods broadcasts, though: every radio repeats each packet it hears, and on a direct link between two radios that only costs airtime, and a radio can't hear while it repeats. For a direct-link benchmark use `direct_only:=true`: packets go out with hop limit 0 and nobody repeats them. At 1 m on `SHORT_FAST`, with the same ramp up to 800 B/s, that cut the losses from 21 to 5 of 142 messages and raised the maximum goodput from 500 to 547 B/s. With `direct_only:=true` a relay in between can't forward anything.
 
 **Range.** Range isn't a separate test. Run the latency and throughput tests at each position, with a `label`. Every result carries RSSI, SNR and hop count.
 
 **GPS.** The test config sets the bridge's `gps_topic` to `/mesh/gps/fix`, so a board with GPS (T-Beam) publishes its fix there. Every result then also holds both positions (`host_lat`/`host_lon`, `peer_lat`/`peer_lon`) and the great-circle distance between them (`distance_m`), so range runs are measured, not just labelled. Latency rows use the echo device's last forwarded fix. Throughput runs use the position in the echo device's report. Fixes older than `max_fix_age_s` (default 300 s) count as no fix. Without a fix on both ends, those columns stay empty and the tests run as before. A T-Beam needs a clear view of the sky, and its first fix can take several minutes. The echo device's position messages cost airtime: one `NavSatFix` (~120 B) every 60 s is ~2 % of the duty-cycle budget on `LONG_FAST`. Raise `position_period_s` if that matters.
 
-**Duty cycle during tests.** Once a device has used its 360 s per hour, the firmware stops transmitting, and the losses you then measure come from the duty-cycle limit, not from the radio link. On `LONG_FAST`, 50 messages of 200 B already use ~100 s. The echo device spends its own budget on pongs and reports.
+**Duty cycle during tests.** Once a device has used its 360 s per hour, the firmware stops transmitting, and the losses you then measure come from the duty-cycle limit, not from the radio link. Runs past the limit keep the radio transmitting for their whole duration: on `SHORT_FAST` a throughput ramp uses roughly 30–60 s of airtime and a sweep 1–2 min. When the budget is used up, the radio refuses every packet. The bridge then logs `Radio refused N packet(s): DUTY_CYCLE_LIMIT`, plus the radio's own notice of when it can send again. On `LONG_FAST` a single 200 B message is ~2 s on air, so the radio saturates at the first ramp step and every run there spends its full duration transmitting. The echo device spends its own budget on pongs and reports.
 
-**Result files** in `~/fleet_test_results/`:
+**Result files** go to `<workspace>/results/` (e.g. `~/fleet_ws/results/`). The workspace is found from where the tests are installed: the first directory above them that holds both `src` and `install`. `output_dir:=...` or `$FLEET_RESULTS_DIR` override it, and `analyze_results.py` reads from the same place.
 
 | File | Contents |
 |---|---|
 | `latency_summary.csv` | One row per latency run: label, sent/answered, RTT median/p95/max, RSSI, SNR, hops, distance (median/min/max) and positions |
 | `latency_<label>_<time>.csv` | One row per ping of a run, with RSSI/SNR/hops, positions and distance |
-| `throughput_summary.csv` | One row per throughput run: label, size, interval, offered load, delivered, goodput, RSSI, SNR, hops, positions and distance |
+| `throughput_summary.csv` | One row per throughput run (a sweep writes one per combination): label, size, interval, offered load, delivered, goodput, RSSI, SNR, hops, positions, distance and status |
 
 Summary files written by an older version of the tests get the new columns added, with blanks in the old rows.
 
