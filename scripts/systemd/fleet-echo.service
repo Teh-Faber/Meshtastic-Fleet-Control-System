@@ -1,0 +1,34 @@
+# Starts the echo device (link tests) at boot on the remote device.
+#
+# Install (adjust User and the paths if the workspace or the repository
+# folder differ):
+#   sudo cp scripts/systemd/fleet-echo.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now fleet-echo
+# Log: ~/echo.log. Stop it to run `scripts/run_test.sh echo` by hand:
+#   sudo systemctl stop fleet-echo
+[Unit]
+Description=Meshtastic fleet echo device (link tests)
+# No network needed: ROS 2 runs localhost-only and the radio is on USB.
+# Waiting for network-online.target delayed the start by about 2 min whenever
+# the Ethernet cable was unplugged (systemd-networkd-wait-online timeout).
+After=local-fs.target
+# Never stop retrying.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu
+Environment=ROS_LOCALHOST_ONLY=1
+ExecStart=/bin/bash -lc "source /home/ubuntu/fleet_ws/install/setup.bash && exec /home/ubuntu/fleet_ws/src/Meshtastic-Fleet-Control-System/scripts/run_test.sh echo >> /home/ubuntu/echo.log 2>&1"
+# Restart after any exit, also a clean one. The bridge reconnects to the radio
+# by itself, so the radio may be plugged in later.
+Restart=always
+RestartSec=5
+# ros2 launch shuts its nodes down cleanly on SIGINT.
+KillSignal=SIGINT
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

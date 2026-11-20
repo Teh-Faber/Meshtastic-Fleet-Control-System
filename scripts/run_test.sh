@@ -25,6 +25,16 @@ case "$test_name" in
     *) usage ;;
 esac
 
+# Only one echo device per radio. When the fleet-echo service already runs it,
+# a second copy started by hand fights it for the radio. systemd sets
+# INVOCATION_ID, so the service itself passes this check.
+if [ "$test_name" = echo ] && [ -z "${INVOCATION_ID:-}" ] && command -v systemctl >/dev/null \
+        && systemctl is-active --quiet fleet-echo 2>/dev/null; then
+    echo "The fleet-echo service already runs the echo device (log: ~/echo.log)." >&2
+    echo "To run it by hand instead: sudo systemctl stop fleet-echo" >&2
+    exit 1
+fi
+
 # Workspace: $WORKSPACE, else the current directory, else the one this script
 # lives in (<workspace>/src/meshtastic_bridge/scripts).
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
